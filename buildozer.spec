@@ -5,7 +5,7 @@ package.domain = org.walletchecker
 source.dir = .
 source.include_exts = py
 version = 0.1
-requirements = python3,kivy==2.3.1,requests,certifi,urllib3,idna,charset_normalizer
+requirements = python3,kivy,requests,certifi,urllib3,idna,charset_normalizer
 orientation = portrait
 fullscreen = 0
 
