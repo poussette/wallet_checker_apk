@@ -43,6 +43,15 @@ class WalletBalance:
     #: the default "priced only" filtering ran; 0 otherwise (including when
     #: --show-unpriced or --no-price was used, since nothing gets filtered).
     hidden_unpriced_count: int = 0
+    #: number of tokens/positions (and the native coin line, if applicable)
+    #: hidden because their value is below the dust threshold (1 cent USD by
+    #: default). Only set when the default filtering ran; 0 with --show-dust,
+    #: --show-unpriced or --no-price.
+    hidden_dust_count: int = 0
+    #: True when the native coin balance itself was hidden for being below the
+    #: dust threshold (the native_* fields keep their values, so totals and
+    #: JSON data stay intact; only the on-screen/CSV native line is skipped).
+    native_hidden: bool = False
 
 
 class BaseProvider(ABC):

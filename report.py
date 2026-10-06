@@ -108,6 +108,22 @@ def filter_unpriced(results: list[WalletBalance]) -> None:
         w.tokens = kept
 
 
+DUST_THRESHOLD_USD = 0.01
+
+
+def filter_dust(results: list[WalletBalance], threshold_usd: float = DUST_THRESHOLD_USD) -> None:
+    """Hide tokens/positions (and the native coin line) worth less than
+    `threshold_usd`. Unpriced entries are left alone (filter_unpriced handles
+    them). Totals and JSON data stay intact; only the display skips them."""
+    for w in results:
+        kept = [t for t in w.tokens if t.usd_value is None or t.usd_value >= threshold_usd]
+        w.hidden_dust_count = len(w.tokens) - len(kept)
+        w.tokens = kept
+        if not w.error and w.native_usd_value is not None and w.native_usd_value < threshold_usd:
+            w.native_hidden = True
+            w.hidden_dust_count += 1
+
+
 def compute_label_totals(results: list[WalletBalance]) -> dict[str, dict[str, float | int]]:
     totals: dict[str, dict[str, float | int]] = {}
     for w in results:
@@ -141,12 +157,13 @@ def format_table(results: list[WalletBalance]) -> str:
         if wallet.error:
             out.write(f"  ERROR: {wallet.error}\n")
         else:
-            usd = fmt_money(wallet.native_usd_value)
-            eur = fmt_money(wallet.native_eur_value)
-            out.write(
-                f"  {wallet.native_symbol}: {wallet.native_amount}"
-                f"   (${usd} / €{eur})\n"
-            )
+            if not wallet.native_hidden:
+                usd = fmt_money(wallet.native_usd_value)
+                eur = fmt_money(wallet.native_eur_value)
+                out.write(
+                    f"  {wallet.native_symbol}: {wallet.native_amount}"
+                    f"   (${usd} / €{eur})\n"
+                )
             if wallet.warning:
                 out.write(f"  (warning: {wallet.warning})\n")
             if wallet.tokens:
@@ -157,12 +174,17 @@ def format_table(results: list[WalletBalance]) -> str:
                         f"  [{tok.asset_type:<24}] {tok.symbol:<10} {tok.amount}"
                         f"   (${usd} / €{eur})  ({tok.name})\n"
                     )
-            elif not wallet.warning and not wallet.hidden_unpriced_count:
+            elif (not wallet.warning and not wallet.hidden_unpriced_count
+                  and not wallet.hidden_dust_count and not wallet.native_hidden):
                 out.write("  (aucun token trouve)\n")
             if wallet.hidden_unpriced_count:
                 out.write(
                     f"  ({wallet.hidden_unpriced_count} position(s) sans valeur "
                     f"connue masquee(s))\n"
+                )
+            if wallet.hidden_dust_count:
+                out.write(
+                    f"  ({wallet.hidden_dust_count} position(s) < 1 centime masquee(s))\n"
                 )
             out.write(
                 f"  TOTAL: ${fmt_money(wallet.total_usd)}"
@@ -222,13 +244,14 @@ def build_csv(results: list[WalletBalance]) -> str:
                 [label, wallet.chain, wallet.address, "native", wallet.native_symbol, "", "", "", "", "", wallet.error, ""]
             )
             continue
-        writer.writerow(
-            [
-                label, wallet.chain, wallet.address, "native", wallet.native_symbol, "",
-                wallet.native_amount, wallet.native_usd_value, wallet.native_eur_value,
-                "", "", wallet.warning or "",
-            ]
-        )
+        if not wallet.native_hidden:
+            writer.writerow(
+                [
+                    label, wallet.chain, wallet.address, "native", wallet.native_symbol, "",
+                    wallet.native_amount, wallet.native_usd_value, wallet.native_eur_value,
+                    "", "", wallet.warning or "",
+                ]
+            )
         for tok in wallet.tokens:
             writer.writerow(
                 [
