@@ -36,8 +36,35 @@ from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
+from kivy.metrics import dp, sp
 
 import report
+
+# Monospace font shipped with Kivy, so the text tables stay aligned.
+try:
+    import kivy
+    MONO_FONT = os.path.join(kivy.kivy_data_dir, "fonts", "RobotoMono-Regular.ttf")
+    if not os.path.exists(MONO_FONT):
+        MONO_FONT = "Roboto"
+except Exception:
+    MONO_FONT = "Roboto"
+
+
+class WrapLabel(Label):
+    """Label that wraps its text to its own width and grows in height."""
+
+    def __init__(self, min_height=0, **kwargs):
+        kwargs.setdefault("halign", "left")
+        kwargs.setdefault("valign", "middle")
+        kwargs.setdefault("font_size", sp(14))
+        kwargs.setdefault("size_hint", (1, None))
+        super().__init__(**kwargs)
+        self._min_h = min_height
+        self.bind(width=self._update, texture_size=self._update)
+
+    def _update(self, *_):
+        self.text_size = (self.width, None)
+        self.height = max(self.texture_size[1] + dp(8), self._min_h)
 
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
@@ -62,37 +89,37 @@ class WalletCheckerApp(App):
         self.settings_path = os.path.join(self.user_data_dir, SETTINGS_FILENAME)
         self.settings = self.load_settings()
 
-        root = BoxLayout(orientation="vertical", padding=10, spacing=8)
+        root = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
 
-        top_bar = BoxLayout(size_hint=(1, None), height=48, spacing=8)
-        top_bar.add_widget(Label(text="Wallet Checker", bold=True, font_size=20))
-        settings_btn = Button(text="Parametres", size_hint=(None, 1), width=140)
+        top_bar = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        top_bar.add_widget(Label(text="Wallet Checker", bold=True, font_size=sp(20), halign="left"))
+        settings_btn = Button(text="Parametres", size_hint=(None, 1), width=dp(130), font_size=sp(14))
         settings_btn.bind(on_release=self.open_settings)
         top_bar.add_widget(settings_btn)
         root.add_widget(top_bar)
 
-        self.run_btn = Button(text="Verifier les wallets", size_hint=(1, None), height=52)
+        self.run_btn = Button(text="Verifier les wallets", size_hint=(1, None), height=dp(56), font_size=sp(16))
         self.run_btn.bind(on_release=self.on_run)
         root.add_widget(self.run_btn)
 
-        self.status_label = Label(
+        self.status_label = WrapLabel(
             text="Ouvre Parametres pour coller ta liste d'adresses, puis appuie sur Verifier.",
-            size_hint=(1, None), height=40,
+            min_height=dp(40),
         )
         root.add_widget(self.status_label)
 
         self.result_view = TextInput(
-            text="", readonly=True, font_size=13,
+            text="", readonly=True, font_size=sp(11), font_name=MONO_FONT,
             background_color=(0.06, 0.06, 0.08, 1), foreground_color=(0.9, 0.9, 0.92, 1),
         )
         scroll = ScrollView()
         scroll.add_widget(self.result_view)
         root.add_widget(scroll)
 
-        export_bar = BoxLayout(size_hint=(1, None), height=48, spacing=8)
-        self.copy_json_btn = Button(text="Copier JSON", disabled=True)
+        export_bar = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        self.copy_json_btn = Button(text="Copier JSON", disabled=True, font_size=sp(14))
         self.copy_json_btn.bind(on_release=self.copy_json)
-        self.copy_csv_btn = Button(text="Copier CSV", disabled=True)
+        self.copy_csv_btn = Button(text="Copier CSV", disabled=True, font_size=sp(14))
         self.copy_csv_btn.bind(on_release=self.copy_csv)
         export_bar.add_widget(self.copy_json_btn)
         export_bar.add_widget(self.copy_csv_btn)
@@ -129,40 +156,45 @@ class WalletCheckerApp(App):
             pass
 
     def open_settings(self, _instance):
-        content = BoxLayout(orientation="vertical", padding=10, spacing=8)
+        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
 
-        content.add_widget(Label(
+        content.add_widget(WrapLabel(
             text="Configuration des wallets (meme format que addresses.txt)",
-            size_hint=(1, None), height=30,
+            min_height=dp(30),
         ))
-        config_input = TextInput(text=self.settings.get("config_text", DEFAULT_CONFIG), font_size=13)
+        config_input = TextInput(
+            text=self.settings.get("config_text", DEFAULT_CONFIG),
+            font_size=sp(12), font_name=MONO_FONT,
+        )
         content.add_widget(config_input)
 
-        keys_row = BoxLayout(size_hint=(1, None), height=44, spacing=8)
-        keys_row.add_widget(Label(text="Cle Etherscan (optionnelle)", size_hint=(0.5, 1)))
+        keys_row = BoxLayout(size_hint=(1, None), height=dp(48), spacing=dp(8))
+        keys_row.add_widget(WrapLabel(text="Cle Etherscan (optionnelle)", size_hint=(0.5, 1), font_size=sp(12)))
         etherscan_input = TextInput(
             text=self.settings.get("etherscan_key", ""), multiline=False, password=True, size_hint=(0.5, 1),
         )
         keys_row.add_widget(etherscan_input)
         content.add_widget(keys_row)
 
-        beacon_row = BoxLayout(size_hint=(1, None), height=44, spacing=8)
-        beacon_row.add_widget(Label(text="Cle beaconcha.in (optionnelle)", size_hint=(0.5, 1)))
+        beacon_row = BoxLayout(size_hint=(1, None), height=dp(48), spacing=dp(8))
+        beacon_row.add_widget(WrapLabel(text="Cle beaconcha.in (optionnelle)", size_hint=(0.5, 1), font_size=sp(12)))
         beacon_input = TextInput(
             text=self.settings.get("beacon_key", ""), multiline=False, password=True, size_hint=(0.5, 1),
         )
         beacon_row.add_widget(beacon_input)
         content.add_widget(beacon_row)
 
-        unpriced_row = BoxLayout(size_hint=(1, None), height=44, spacing=8)
-        unpriced_checkbox = CheckBox(active=self.settings.get("show_unpriced", False), size_hint=(None, 1), width=44)
+        unpriced_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        unpriced_checkbox = CheckBox(active=self.settings.get("show_unpriced", False), size_hint=(None, 1), width=dp(44))
         unpriced_row.add_widget(unpriced_checkbox)
-        unpriced_row.add_widget(Label(text="Afficher aussi les positions sans valeur connue"))
+        unpriced_row.add_widget(WrapLabel(
+            text="Afficher aussi les positions sans valeur connue", size_hint=(1, 1), font_size=sp(12),
+        ))
         content.add_widget(unpriced_row)
 
-        buttons_row = BoxLayout(size_hint=(1, None), height=48, spacing=8)
-        save_btn = Button(text="Enregistrer")
-        cancel_btn = Button(text="Annuler")
+        buttons_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        save_btn = Button(text="Enregistrer", font_size=sp(15))
+        cancel_btn = Button(text="Annuler", font_size=sp(15))
         buttons_row.add_widget(cancel_btn)
         buttons_row.add_widget(save_btn)
         content.add_widget(buttons_row)
