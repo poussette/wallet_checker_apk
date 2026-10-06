@@ -6,8 +6,19 @@ on:
 
 jobs:
   build:
+    name: build (${{ matrix.name }})
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    strategy:
+      fail-fast: false   # one variant failing must not cancel the other
+      matrix:
+        include:
+          # One APK that installs on virtually every phone (32 + 64 bit)...
+          - name: universal
+            archs: "arm64-v8a,armeabi-v7a"
+          # ...and a lighter one for modern 64-bit phones only.
+          - name: arm64
+            archs: "arm64-v8a"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,12 +59,17 @@ jobs:
           sed -i "/^\[app\]/a p4a.source_dir = $HOME/p4a" buildozer.spec
           head -3 buildozer.spec
 
+      - name: Select ABIs for this variant (${{ matrix.name }})
+        run: |
+          sed -i "s/^android.archs = .*/android.archs = ${{ matrix.archs }}/" buildozer.spec
+          grep -n "^android.archs" buildozer.spec
+
       # SDK/NDK downloads (~1-2 GB) are the slow part; keep them between runs.
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-p4a2024-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-p4a2024-${{ matrix.name }}-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
         shell: bash   # bash -eo pipefail: a buildozer failure fails the step
@@ -72,11 +88,11 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
+          name: build-log-${{ matrix.name }}
           path: build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: wallet-checker-apk
+          name: wallet-checker-apk-${{ matrix.name }}
           path: bin/*.apk
