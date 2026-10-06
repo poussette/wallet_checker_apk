@@ -7,7 +7,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-22.04
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
 
@@ -32,15 +32,48 @@ jobs:
           python -m pip install --upgrade pip
           pip install --upgrade buildozer Cython==0.29.33 virtualenv
 
+      # python-for-android's current "master" builds Python 3.14 and its build
+      # venv ends up with a broken pip (ImportError in `pip install -U pip`).
+      # Pin the last well-tested release instead (builds Python 3.11).
+      - name: Pin python-for-android v2024.01.21
+        run: |
+          git clone --depth 1 --branch v2024.01.21 \
+            https://github.com/kivy/python-for-android.git "$HOME/p4a"
+          # Download OpenSSL 1.1.1w from its GitHub release (stable URL)
+          # instead of openssl.org's source/ directory.
+          sed -i 's#https://www.openssl.org/source/openssl-{url_version}.tar.gz#https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/openssl-{url_version}.tar.gz#' \
+            "$HOME/p4a/pythonforandroid/recipes/openssl/__init__.py"
+          grep -n "url = " "$HOME/p4a/pythonforandroid/recipes/openssl/__init__.py"
+          # Tell Buildozer to use this checkout (CI-only, not stored in the repo).
+          sed -i "/^\[app\]/a p4a.source_dir = $HOME/p4a" buildozer.spec
+          head -3 buildozer.spec
+
       # SDK/NDK downloads (~1-2 GB) are the slow part; keep them between runs.
       - name: Cache Android SDK/NDK
         uses: actions/cache@v4
         with:
           path: ~/.buildozer
-          key: buildozer-${{ runner.os }}-${{ hashFiles('buildozer.spec') }}
+          key: buildozer-${{ runner.os }}-p4a2024-${{ hashFiles('buildozer.spec') }}
 
       - name: Build APK
-        run: buildozer -v android debug
+        shell: bash   # bash -eo pipefail: a buildozer failure fails the step
+        run: buildozer -v android debug 2>&1 | tee build.log
+
+      - name: Show the end of the log (on failure)
+        if: failure()
+        shell: bash
+        run: |
+          echo "=== last 100 lines, compiler/environment noise filtered out ==="
+          sed 's/\x1b\[[0-9;]*m//g' build.log \
+            | grep -v -E '(/usr/bin/install|rm -f|Compiling |clang|gcc |llvm-ar|^\[DEBUG\]:\s+\./|^#\s+[A-Za-z_0-9]+ = )' \
+            | tail -n 100 | cut -c1-300
+
+      - name: Upload full build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
