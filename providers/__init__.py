@@ -11,7 +11,10 @@ and registers itself in PROVIDERS below. To add a new blockchain:
 That's the only file that needs touching to plug in a new chain.
 """
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
+
+
+
 
 
 from .base import BaseProvider

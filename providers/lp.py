@@ -29,7 +29,10 @@ ADAPTERS below. See README, section "LP tokens".
 
 from __future__ import annotations
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
+
+
+
 
 
 import base64
@@ -97,7 +100,8 @@ ADAPTERS: list[dict] = [
     },
     {   # JEX: one dedicated contract per pair, separate views.
         "name": "jex-pair", "kind": "named", "curve": "constant_product",
-        "code_hashes": ["kDh8hR9vyceELMUuy6JdAg0X90+ZaLeyVQS6tPbY82s="],
+        "code_hashes": ["kDh8hR9vyceELMUuy6JdAg0X90+ZaLeyVQS6tPbY82s=",
+                        "Xjk15W4/HVIx+gPFvNqKxdyu9sQhki2AoeEQplOTxuU="],  # JEX/SPORE pair
         "lp": ["getLpToken"],
         "first": ["getFirstToken"],
         "second": ["getSecondToken"],
@@ -378,6 +382,8 @@ class PoolState:
         self.verified = verified          # contract code hash is a known one
         self.from_balances = from_balances  # reserves = contract balances, not a view
         self.virtual_price = virtual_price  # stable pools: LP value in peg units, 1e18 scale
+        self.trust: str | None = None        # "known" | "approved" | "permissive" | None
+        self.code_hash: str | None = None
 
 
 class Inconsistent(Exception):
@@ -413,8 +419,13 @@ def _verify(spec, sc, facts, reserves: dict[str, int], supply: int, budget: Budg
             raise requests.RequestException("LP query budget exhausted")
         if not _within(res, _balance(sc, tok)):
             raise Inconsistent("reserve exceeds the contract's balance")
-    verified = _code_hash(sc, budget) in spec.get("code_hashes", ())
-    return PoolState(spec["name"], dict(reserves), spec["curve"], verified, from_balances, virtual_price)
+    h = _code_hash(sc, budget)
+    trust = "known" if h in spec.get("code_hashes", ()) else (
+        "approved" if _CACHE.is_trusted(h, spec["name"]) else (
+            "permissive" if trust_all() else None))
+    st = PoolState(spec["name"], dict(reserves), spec["curve"], trust is not None, from_balances, virtual_price)
+    st.trust, st.code_hash = trust, h
+    return st
 
 
 def _names_lp(spec, sc, lp, budget, args) -> bool | None:
@@ -435,6 +446,7 @@ def _names_lp(spec, sc, lp, budget, args) -> bool | None:
 # Content is public chain data only (token ids, contract addresses).
 
 _ADDR_RE = re.compile(r"erd1[a-z0-9]{58}")
+_HASH_RE = re.compile(r"[A-Za-z0-9+/]{43}=")  # base64 of a sha256
 
 
 def _adapter_signature() -> str:
@@ -446,6 +458,7 @@ class LPCache:
         self.path = path
         self.pools: dict[str, dict] = {}
         self.fail: dict[str, float] = {}
+        self.trusted: dict[str, str] = {}   # code hash -> adapter, approved by the user
         self.dirty = False
         if path:
             self._load()
@@ -470,6 +483,10 @@ class LPCache:
                 and e.get("spec") in names
             ):
                 self.pools[lp] = {"sc": e["sc"], "spec": e["spec"]}
+        trusted = doc.get("trusted")
+        for h, spec in (trusted.items() if isinstance(trusted, dict) else ()):
+            if len(self.trusted) < 200 and _HASH_RE.fullmatch(str(h)) and spec in names:
+                self.trusted[h] = spec
         # "unreadable" verdicts only hold for the adapter set that produced them
         fails = doc.get("fail")
         if doc.get("sig") == _adapter_signature() and isinstance(fails, dict):
@@ -498,6 +515,17 @@ class LPCache:
         if self.pools.pop(lp, None) is not None:
             self.dirty = True
 
+    def is_trusted(self, code_hash: str | None, spec: str) -> bool:
+        return bool(code_hash) and self.trusted.get(code_hash) == spec
+
+    def add_trusted(self, code_hash: str, spec: str) -> bool:
+        """Remember a code hash the USER approved (lp_probe.py --trust)."""
+        if not _HASH_RE.fullmatch(code_hash or "") or len(self.trusted) >= 200:
+            return False
+        self.trusted[code_hash] = spec
+        self.dirty = True
+        return True
+
     def is_failed(self, lp: str) -> bool:
         ts = self.fail.get(lp)
         return ts is not None and 0 < time.time() - ts < FAIL_TTL
@@ -510,7 +538,8 @@ class LPCache:
     def save(self) -> None:
         if not self.path or not self.dirty:
             return
-        data = json.dumps({"v": 1, "sig": _adapter_signature(), "pools": self.pools, "fail": self.fail})
+        data = json.dumps({"v": 1, "sig": _adapter_signature(), "pools": self.pools,
+                           "fail": self.fail, "trusted": self.trusted})
         try:
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = f"{self.path}.tmp"
@@ -530,6 +559,16 @@ def set_cache_path(path: str | None) -> None:
     """Persist the discovery cache at `path` (None = memory only)."""
     global _CACHE
     _CACHE = LPCache(path)
+
+
+def default_cache_path() -> str:
+    return os.path.join(os.path.expanduser("~"), ".wallet_checker", "lp_cache.json")
+
+
+def trust_all() -> bool:
+    """Permissive mode (user setting): a contract that passes every consistency
+    check counts as verified even if its code hash is unknown."""
+    return os.environ.get("WALLET_LP_TRUST_ALL") == "1"
 
 
 def get_cache() -> LPCache:
@@ -787,12 +826,13 @@ def price_lp_tokens(candidates: list[str], fetch_infos, on_progress=None) -> dic
     Never raises: any failure just leaves that LP unvalued. When a pass runs out
     of budget, up to MAX_PASSES passes continue with the LP tokens left over."""
     lc = _CACHE
-    ordered = list(dict.fromkeys(c for c in candidates if _TOKEN_ID_RE.fullmatch(str(c))))[:MAX_LP_TOKENS]
+    valid = list(dict.fromkeys(c for c in candidates if _TOKEN_ID_RE.fullmatch(str(c))))
+    ordered = valid[:MAX_LP_TOKENS]
     unreadable = [lp for lp in ordered if lc.is_failed(lp)]
     # known pools first (cheap, certain), then the unexamined ones, in given order
     todo = sorted((lp for lp in ordered if not lc.is_failed(lp)), key=lambda lp: 0 if lc.good(lp) else 1)
     stats = LAST_STATS
-    stats.update(candidates=len(set(candidates)), examined=0, valued=0, stopped=False,
+    stats.update(candidates=len(valid), examined=0, valued=0, stopped=False,
                  unreadable=len(unreadable), remaining=0)
     found: list[tuple[str, dict, PoolState]] = []
     total = len(todo)
@@ -831,7 +871,8 @@ def price_lp_tokens(candidates: list[str], fetch_infos, on_progress=None) -> dic
         lc.save()
         todo = remaining
     stats["remaining"] = len(todo)
-    stats["stopped"] = bool(todo) or len(set(candidates)) > len(ordered)
+    stats["remaining"] += max(0, len(valid) - len(ordered))
+    stats["stopped"] = stats["remaining"] > 0
     lc.save()
     if not found:
         return {}
@@ -857,7 +898,11 @@ def price_lp_tokens(candidates: list[str], fetch_infos, on_progress=None) -> dic
                 label += ", estimation 50/50"
             if st.from_balances:
                 label += ", soldes du contrat"
-            if not st.verified:
+            if st.trust == "approved":
+                label += ", hash approuvé"
+            elif st.trust == "permissive":
+                label += ", contrat non vérifié (mode permissif)"
+            elif not st.verified:
                 label += ", contrat non vérifié"
             out[lp] = {"usd": price, "adapter": label, "supply": supply}
     stats["valued"] = len(out)

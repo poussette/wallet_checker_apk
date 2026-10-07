@@ -14,7 +14,10 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
+
+
+
 
 
 import os
@@ -54,7 +57,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.8.4"
+APP_VERSION = "0.9.0"
 
 
 def _version_problems() -> list[str]:
@@ -100,6 +103,7 @@ DEFAULT_SETTINGS = {
     "show_dust": False,
     "secure_screen": False,
     "lp_pricing": True,
+    "lp_trust_all": False,
     "mvx_gateway": "",
 }
 
@@ -128,7 +132,7 @@ def sanitize_settings(raw) -> dict:
     gw = raw.get("mvx_gateway")
     if isinstance(gw, str) and (not gw.strip() or validate_rpc_url(gw.strip())):
         out["mvx_gateway"] = gw.strip()[:MAX_KEY_CHARS]  # empty = public default
-    for k in ("show_unpriced", "show_dust", "secure_screen", "lp_pricing"):
+    for k in ("show_unpriced", "show_dust", "secure_screen", "lp_pricing", "lp_trust_all"):
         if isinstance(raw.get(k), bool):
             out[k] = raw[k]
     return out
@@ -693,6 +697,15 @@ class WalletCheckerApp(App):
         ))
         content.add_widget(lp_row)
 
+        trust_row = BoxLayout(size_hint=(1, None), height=dp(64), spacing=dp(8))
+        trust_checkbox = CheckBox(active=self.settings.get("lp_trust_all", False), size_hint=(None, 1), width=dp(44))
+        trust_row.add_widget(trust_checkbox)
+        trust_row.add_widget(WrapLabel(
+            text="Mode permissif LP : valoriser aussi les pools dont le code est inconnu (moins sûr)",
+            size_hint=(1, 1), font_size=sp(12),
+        ))
+        content.add_widget(trust_row)
+
         secure_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
         secure_checkbox = CheckBox(active=self.settings.get("secure_screen", False), size_hint=(None, 1), width=dp(44))
         secure_row.add_widget(secure_checkbox)
@@ -719,6 +732,7 @@ class WalletCheckerApp(App):
                 "show_dust": dust_checkbox.active,
                 "secure_screen": secure_checkbox.active,
                 "lp_pricing": lp_checkbox.active,
+                "lp_trust_all": trust_checkbox.active,
                 "mvx_gateway": gw_input.text.strip(),
             })
             gw_rejected = bool(gw_input.text.strip()) and not self.settings.get("mvx_gateway")
@@ -782,6 +796,7 @@ class WalletCheckerApp(App):
             os.environ["BEACONCHAIN_API_KEY"] = self.settings.get("beacon_key", "") or ""
             os.environ["MULTIVERSX_GATEWAY_URL"] = self.settings.get("mvx_gateway", "") or ""
             os.environ["WALLET_LP_PRICING"] = "1" if self.settings.get("lp_pricing", True) else "0"
+            os.environ["WALLET_LP_TRUST_ALL"] = "1" if self.settings.get("lp_trust_all", False) else "0"
 
             def progress(done, total):
                 Clock.schedule_once(

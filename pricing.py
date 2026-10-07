@@ -25,7 +25,10 @@ address, its platform id to TOKEN_PLATFORM_IDS.
 
 from __future__ import annotations
 
-__version__ = "0.8.4"
+__version__ = "0.9.0"
+
+
+
 
 
 import os
@@ -352,10 +355,13 @@ def apply_pricing(results: list[WalletBalance], on_progress=None) -> bool:
         if lp_candidates:
             lp_prices = lp_module.price_lp_tokens(lp_candidates, _fetch_token_info, on_progress)
             st = lp_module.LAST_STATS
-            if st.get("stopped") or st.get("valued", 0) < st.get("candidates", 0):
+            if st.get("valued", 0) < st.get("candidates", 0):
+                left = st.get("remaining", 0)
+                unknown = st["candidates"] - st.get("valued", 0) - left
                 LAST_NOTES.append(
                     f"LP : {st.get('valued', 0)} valorisé(s) sur {st.get('candidates', 0)} détecté(s)"
-                    + (f" · {st['remaining']} restant(s), relancez pour continuer" if st.get("stopped") else "")
+                    + (f" · {left} à traiter, relancez pour continuer" if left else "")
+                    + (f" · {unknown} non reconnu(s)" if unknown > 0 else "")
                 )
 
     for w in results:
