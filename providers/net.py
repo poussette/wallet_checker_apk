@@ -16,6 +16,7 @@ TLS certificate verification is never disabled.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from urllib.parse import urljoin, urlsplit
 
@@ -71,6 +72,77 @@ def _read_capped(resp, max_bytes: int) -> bytes:
 
 MAX_REDIRECTS = 3
 
+#: transient failures are retried (public APIs rate-limit and flake a lot):
+#: delays in seconds between attempts; () disables retrying.
+RETRY_DELAYS = (1.0, 3.0)
+_RETRY_STATUS = {429, 502, 503, 504}
+MAX_RETRY_AFTER = 10.0
+
+#: minimum spacing (seconds) between two request *starts* to the same host,
+#: shared by all worker threads: stays under the free-tier rate limits
+#: (api.multiversx.com answers 429 when 24 wallets fire ~7 calls each at once).
+THROTTLE_ENABLED = True
+MIN_INTERVAL = {"api.multiversx.com": 0.4, "api.coingecko.com": 1.5}
+DEFAULT_INTERVAL = 0.05
+_throttle_lock = threading.Lock()
+_next_slot: dict[str, float] = {}
+
+
+def _sleep(seconds: float) -> None:
+    time.sleep(seconds)
+
+
+def _throttle(url: str) -> None:
+    if not THROTTLE_ENABLED:
+        return
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return
+    interval = MIN_INTERVAL.get(host, DEFAULT_INTERVAL)
+    with _throttle_lock:
+        now = time.monotonic()
+        slot = max(now, _next_slot.get(host, 0.0))
+        _next_slot[host] = slot + interval
+    if slot > now:
+        _sleep(slot - now)
+
+
+def _short_http_error(resp) -> str:
+    """HTTP error text without the full URL (it may carry keys/addresses)."""
+    try:
+        host = urlsplit(resp.url).hostname or "API"
+    except ValueError:
+        host = "API"
+    return f"HTTP {resp.status_code} from {host}"
+
+
+def _send(method, url, params, json_body, timeout, allow_loopback_http):
+    """One request, following redirects by hand: the scheme of every hop is
+    checked *before* the next request is sent, so a hijacked endpoint
+    answering `302 -> http://...` never receives the request (and its API key)
+    in clear text."""
+    for _hop in range(MAX_REDIRECTS + 1):
+        _throttle(url)
+        try:
+            resp = requests.request(
+                method, url, params=params, json=json_body, timeout=timeout,
+                stream=True, allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            raise HttpError(redact(str(exc))) from None
+        location = resp.headers.get("Location") if 300 <= resp.status_code < 400 else None
+        if not location:
+            return resp
+        resp.close()
+        url = urljoin(url, location)
+        if not _https_or_loopback(url, allow_loopback_http):
+            raise HttpError("Refusing redirect to a non-HTTPS URL")
+        if resp.status_code in (301, 302, 303):
+            method, json_body = "GET", None
+        params = None  # the redirect target already carries its own query
+    raise HttpError("Too many redirects")
+
 
 def request_json(
     method: str,
@@ -82,41 +154,37 @@ def request_json(
     max_bytes: int = DEFAULT_MAX_BYTES,
     allow_loopback_http: bool = False,
 ):
-    """Perform the request and return the decoded JSON document.
-
-    Redirects are followed by hand so that the scheme of every hop is checked
-    *before* the next request is sent: a hijacked endpoint answering
-    `302 -> http://...` must never receive the request (and its API key) in
-    clear text.
-    """
+    """Perform the request and return the decoded JSON document. Rate limits
+    (429/502/503/504), timeouts and connection errors are retried with a
+    short back-off (honouring Retry-After)."""
     if not _https_or_loopback(url, allow_loopback_http):
         raise HttpError("Refusing non-HTTPS URL")
-    resp = None
-    for _hop in range(MAX_REDIRECTS + 1):
+    delays = list(RETRY_DELAYS)
+    while True:
+        wait = None
         try:
-            resp = requests.request(
-                method, url, params=params, json=json_body, timeout=timeout,
-                stream=True, allow_redirects=False,
-            )
-        except requests.RequestException as exc:
-            raise HttpError(redact(str(exc))) from None
-        location = resp.headers.get("Location") if 300 <= resp.status_code < 400 else None
-        if not location:
-            break
-        resp.close()
-        url = urljoin(url, location)
-        if not _https_or_loopback(url, allow_loopback_http):
-            raise HttpError("Refusing redirect to a non-HTTPS URL")
-        if resp.status_code in (301, 302, 303):
-            method, json_body = "GET", None
-        params = None  # the redirect target already carries its own query
-    else:
-        raise HttpError("Too many redirects")
+            resp = _send(method, url, params, json_body, timeout, allow_loopback_http)
+        except HttpError as exc:
+            transient = "redirect" not in str(exc) and "non-HTTPS" not in str(exc)
+            if not (transient and delays):
+                raise
+            wait = delays.pop(0)
+        else:
+            if resp.status_code in _RETRY_STATUS and delays:
+                wait = delays.pop(0)
+                try:
+                    wait = max(wait, min(float(resp.headers.get("Retry-After", 0)), MAX_RETRY_AFTER))
+                except (TypeError, ValueError):
+                    pass
+                resp.close()
+            else:
+                break
+        _sleep(wait)
     try:
         try:
             resp.raise_for_status()
-        except requests.HTTPError as exc:
-            raise HttpError(redact(str(exc))) from None
+        except requests.HTTPError:
+            raise HttpError(_short_http_error(resp)) from None
         body = _read_capped(resp, max_bytes)
     finally:
         resp.close()

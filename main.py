@@ -51,7 +51,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error
 
-APP_VERSION = "0.5"
+APP_VERSION = "0.5.1"
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
 # Monospace font shipped with Kivy (used for the config editor).
