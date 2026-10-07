@@ -51,7 +51,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.7"
+APP_VERSION = "0.8"
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
 # Monospace font shipped with Kivy (used for the config editor).
@@ -774,9 +774,18 @@ class WalletCheckerApp(App):
             results = report.fetch_all(entries, workers=4, on_progress=progress)
 
             priced_ok = True
+            notes = []
             try:
-                from pricing import apply_pricing
-                priced_ok = apply_pricing(results) is not False
+                import pricing as _pricing
+                from providers import lp as _lp
+                _lp.set_cache_path(os.path.join(self.user_data_dir, "lp_cache.json"))
+
+                def _lp_progress(done, total, ok):
+                    Clock.schedule_once(lambda dt: setattr(
+                        self.status_label, "text", f"Valorisation des LP : {done}/{total} ({ok} valorisés)..."))
+
+                priced_ok = _pricing.apply_pricing(results, on_progress=_lp_progress) is not False
+                notes = [clean_text(n, 120) for n in _pricing.LAST_NOTES]
             except Exception:
                 priced_ok = False  # offline / pricing down: keep raw balances
 
@@ -786,13 +795,13 @@ class WalletCheckerApp(App):
                     report.filter_dust(results)
 
             text = report.format_table(results)
-            Clock.schedule_once(lambda dt: self._finish(results, text, None, priced_ok))
+            Clock.schedule_once(lambda dt: self._finish(results, text, None, priced_ok, notes))
         except Exception as exc:
             # Never show a raw traceback: it can embed URLs with API keys.
             err = safe_error(exc) or exc.__class__.__name__
-            Clock.schedule_once(lambda dt: self._finish(None, None, err, True))
+            Clock.schedule_once(lambda dt: self._finish(None, None, err, True, []))
 
-    def _finish(self, results, text, error, priced_ok):
+    def _finish(self, results, text, error, priced_ok, notes=()):
         self.running = False
         self.run_btn.disabled = False
         self.run_btn.text = "Actualiser"
@@ -814,6 +823,8 @@ class WalletCheckerApp(App):
         msg = f"Mis à jour à {time.strftime('%H:%M')} · {len(results)} wallet(s)"
         if not priced_ok:
             msg += " · prix indisponibles, soldes bruts affichés"
+        for note in notes:
+            msg += " · " + note
         self.status_label.text = msg
         self.export_btn.disabled = False
         self.scroll.scroll_y = 1

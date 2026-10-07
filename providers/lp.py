@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import math
 import os
 import re
@@ -47,13 +48,17 @@ DEFAULT_GATEWAY = "https://gateway.multiversx.com"
 MVX_API = "https://api.multiversx.com"
 
 #: hard budgets per run, so a hostile/unknown contract cannot cost minutes.
-MAX_LP_TOKENS = 40
-MAX_VM_CALLS = 300
-MAX_OWNER_CALLS = 60          # per candidate contract (unknown contracts stay cheap)
+MAX_LP_TOKENS = 80
+MAX_PASSES = 3                # a new budget per pass, same run
+FAIL_TTL = 86400              # seconds an unrecognised LP is skipped
+MAX_CACHE_ENTRIES = 2000
+MAX_CACHE_BYTES = 500_000
+MAX_VM_CALLS = 1000
+MAX_OWNER_CALLS = 200         # per candidate contract (unknown contracts stay cheap)
 MAX_CANDIDATES = 4            # candidate pool contracts per LP token
 MAX_RETURN_ITEMS = 5000       # OneDex returns one item per pair (~1500 today)
 MAX_RESPONSE_BYTES = 4_000_000
-DEADLINE_SECONDS = 60         # wall clock for the whole LP step
+DEADLINE_SECONDS = 120        # wall clock for the whole LP step
 MAX_SUPPLY_RAW = 10**60       # anything above is hostile metadata
 BALANCE_TOLERANCE = 1.05      # indexed API balances can lag the live gateway
 LP_MAX_POSITION_USD = 5e7     # a personal LP position above this is not credible
@@ -61,6 +66,10 @@ LP_MAX_POSITION_USD = 5e7     # a personal LP position above this is not credibl
 _TOKEN_ID_RE = re.compile(r"[A-Z0-9]{3,10}-[0-9a-f]{6}")  # use fullmatch
 _SC_PREFIX = "erd1qqqqqqqq"  # smart-contract addresses start with 8 zero bytes
 _LP_WORDS = ("lp", "liquidity", "pool")
+
+
+#: filled by price_lp_tokens: how far the last run got (shown to the user).
+LAST_STATS: dict = {"candidates": 0, "examined": 0, "valued": 0, "stopped": False}
 
 
 def gateway_url() -> str:
@@ -141,9 +150,9 @@ PROBE_NAMES = [
 class Budget:
     """Call budget (optionally nested under a parent) plus a wall-clock deadline."""
 
-    def __init__(self, calls: int = MAX_VM_CALLS, parent: "Budget | None" = None,
+    def __init__(self, calls: int | None = None, parent: "Budget | None" = None,
                  deadline: float | None = None):
-        self.calls = calls
+        self.calls = MAX_VM_CALLS if calls is None else calls
         self.parent = parent
         self.deadline = deadline if deadline is not None else time.monotonic() + DEADLINE_SECONDS
 
@@ -322,16 +331,21 @@ def candidate_contracts(lp: str, facts: dict) -> list[str]:
 
 
 def _balance(sc: str, token: str) -> int:
-    """The contract's real balance of one fungible token (0 if it holds none)."""
+    """The contract's live balance of one fungible token, read from the node
+    (gateway: faster than the indexed API, and the same node as the views)."""
     try:
-        d = request_json("GET", f"{MVX_API}/accounts/{quote(sc, safe='')}/tokens/{quote(token, safe='')}")
+        d = request_json(
+            "GET", f"{gateway_url()}/address/{quote(sc, safe='')}/esdt/{quote(token, safe='')}",
+            max_bytes=100_000, allow_loopback_http=True,
+        )
     except HttpError as exc:
-        if str(exc).startswith("HTTP 404"):
-            return 0
+        if re.match(r"HTTP 4\d\d ", str(exc)) and not str(exc).startswith("HTTP 429"):
+            return 0  # the node answers an error for "holds none of it"
         raise
     try:
-        return max(0, int(d.get("balance", 0))) if isinstance(d, dict) else 0
-    except (TypeError, ValueError):
+        data = d["data"]["tokenData"]["balance"] if isinstance(d, dict) else 0
+        return max(0, int(data))
+    except (KeyError, TypeError, ValueError):
         return 0
 
 
@@ -390,6 +404,115 @@ def _names_lp(spec, sc, lp, budget, args) -> bool | None:
     if as_token_id(ans[0]) != lp:
         raise Inconsistent("pool names another LP token")
     return True
+
+
+# ------------------------------------------------------------------------ cache
+# Remembers, per LP token, WHICH contract is the pool and WHICH adapter reads it
+# (so later runs skip the discovery), and which LP tokens nobody could read (so
+# spam does not eat the budget on every run). It never stores a price or a
+# reserve: values are recomputed and re-verified against the chain every run.
+# Content is public chain data only (token ids, contract addresses).
+
+_ADDR_RE = re.compile(r"erd1[a-z0-9]{58}")
+
+
+def _adapter_signature() -> str:
+    return "|".join(sorted(f"{a['name']}:{','.join(a.get('code_hashes', ()))}" for a in ADAPTERS))
+
+
+class LPCache:
+    def __init__(self, path: str | None = None):
+        self.path = path
+        self.pools: dict[str, dict] = {}
+        self.fail: dict[str, float] = {}
+        self.dirty = False
+        if path:
+            self._load()
+
+    def _load(self) -> None:
+        try:
+            if os.path.getsize(self.path) > MAX_CACHE_BYTES:
+                return
+            with open(self.path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except (OSError, ValueError):
+            return
+        if not isinstance(doc, dict) or doc.get("v") != 1:
+            return
+        names = {a["name"] for a in ADAPTERS}
+        pools = doc.get("pools")
+        for lp, e in (pools.items() if isinstance(pools, dict) else ()):
+            if (
+                len(self.pools) < MAX_CACHE_ENTRIES and isinstance(lp, str)
+                and _TOKEN_ID_RE.fullmatch(lp) and isinstance(e, dict)
+                and isinstance(e.get("sc"), str) and _ADDR_RE.fullmatch(e["sc"])
+                and e.get("spec") in names
+            ):
+                self.pools[lp] = {"sc": e["sc"], "spec": e["spec"]}
+        # "unreadable" verdicts only hold for the adapter set that produced them
+        fails = doc.get("fail")
+        if doc.get("sig") == _adapter_signature() and isinstance(fails, dict):
+            now = time.time()
+            for lp, ts in fails.items():
+                if (
+                    len(self.fail) < MAX_CACHE_ENTRIES and isinstance(lp, str)
+                    and _TOKEN_ID_RE.fullmatch(lp) and isinstance(ts, (int, float))
+                    and not isinstance(ts, bool) and 0 < now - ts < FAIL_TTL
+                ):
+                    self.fail[lp] = float(ts)
+
+    def good(self, lp: str):
+        e = self.pools.get(lp)
+        return (e["sc"], e["spec"]) if e else None
+
+    def put_good(self, lp: str, sc: str, spec: str) -> None:
+        if len(self.pools) < MAX_CACHE_ENTRIES or lp in self.pools:
+            if self.pools.get(lp) != {"sc": sc, "spec": spec}:
+                self.pools[lp] = {"sc": sc, "spec": spec}
+                self.dirty = True
+        if self.fail.pop(lp, None) is not None:
+            self.dirty = True
+
+    def drop_good(self, lp: str) -> None:
+        if self.pools.pop(lp, None) is not None:
+            self.dirty = True
+
+    def is_failed(self, lp: str) -> bool:
+        ts = self.fail.get(lp)
+        return ts is not None and 0 < time.time() - ts < FAIL_TTL
+
+    def put_fail(self, lp: str) -> None:
+        if len(self.fail) < MAX_CACHE_ENTRIES or lp in self.fail:
+            self.fail[lp] = time.time()
+            self.dirty = True
+
+    def save(self) -> None:
+        if not self.path or not self.dirty:
+            return
+        data = json.dumps({"v": 1, "sig": _adapter_signature(), "pools": self.pools, "fail": self.fail})
+        try:
+            os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
+            tmp = f"{self.path}.tmp"
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(data)
+            os.replace(tmp, self.path)
+            self.dirty = False
+        except OSError:
+            pass  # a cache that cannot be written is only a missed optimisation
+
+
+_CACHE = LPCache()
+
+
+def set_cache_path(path: str | None) -> None:
+    """Persist the discovery cache at `path` (None = memory only)."""
+    global _CACHE
+    _CACHE = LPCache(path)
+
+
+def get_cache() -> LPCache:
+    return _CACHE
 
 
 # --------------------------------------------------------------------- strategies
@@ -484,18 +607,38 @@ def _try_lists(spec, lp, facts, sc, ctx, budget):
 _STRATEGY = {"pair3": _try_pair3, "named": _try_named, "keyed": _try_keyed, "lists": _try_lists}
 
 
+def _ctx(cache: dict, sc: str, budget: Budget) -> dict:
+    return cache.setdefault(sc, {
+        "dead": False, "spec": None,
+        "budget": Budget(MAX_OWNER_CALLS, parent=budget, deadline=budget.deadline),
+    })
+
+
 def discover_pool(lp: str, budget: Budget, cache: dict) -> tuple[dict, PoolState] | None:
+    """(facts, PoolState) or None when the LP cannot be read. Network problems
+    and budget exhaustion raise requests.RequestException (= "try again later")."""
     facts = _token_facts(lp)
     if not facts:
         return None
+    lc = _CACHE
+    hit = lc.good(lp)
+    if hit:  # fast path: the pool and its dialect are known, only verify
+        sc, spec_name = hit
+        spec = next((x for x in ADAPTERS if x["name"] == spec_name), None)
+        if spec:
+            ctx = _ctx(cache, sc, budget)
+            try:
+                state = _STRATEGY[spec["kind"]](spec, lp, facts, sc, ctx, ctx["budget"])
+            except Inconsistent:
+                state = None
+            if state:
+                return facts, state
+        lc.drop_good(lp)  # stale (pool migrated / contract upgraded): rediscover
     for sc in candidate_contracts(lp, facts):
-        ctx = cache.setdefault(sc, {
-            "dead": False, "spec": None,
-            "budget": Budget(MAX_OWNER_CALLS, parent=budget, deadline=budget.deadline),
-        })
+        ctx = _ctx(cache, sc, budget)
         if ctx["dead"]:
             continue
-        specs = ([ctx["spec"]] if ctx["spec"] else []) + [s for s in ADAPTERS if s is not ctx["spec"]]
+        specs = ([ctx["spec"]] if ctx["spec"] else []) + [x for x in ADAPTERS if x is not ctx["spec"]]
         answered = False
         for spec in specs:
             try:
@@ -503,10 +646,9 @@ def discover_pool(lp: str, budget: Budget, cache: dict) -> tuple[dict, PoolState
             except Inconsistent:
                 answered = True
                 break  # answered but contradicted by the chain: distrust this contract
-            except requests.RequestException:
-                raise  # budget / deadline / outage: the caller leaves this LP unvalued
             if state:
                 ctx["spec"] = spec
+                lc.put_good(lp, sc, spec["name"])
                 return facts, state
         if not answered and ctx["spec"] is None and not ctx.get("id_map"):
             ctx["dead"] = True  # speaks none of the known dialects: skip for other LPs
@@ -560,26 +702,66 @@ def looks_like_lp(symbol: str, name: str) -> bool:
     return any(w in text for w in _LP_WORDS)
 
 
-def price_lp_tokens(candidates: list[str], fetch_infos) -> dict[str, dict]:
+def _global_exhausted(budget: Budget) -> bool:
+    return budget.calls <= 0 or time.monotonic() > budget.deadline
+
+
+def price_lp_tokens(candidates: list[str], fetch_infos, on_progress=None) -> dict[str, dict]:
     # `candidates` should be ordered most-valuable-first (the per-run limits
     # then spare the real positions, not the alphabetically early spam).
-    """{lp_identifier: {"usd": unit price, "adapter": label}} for the LP tokens
-    among `candidates` that could be valued. `fetch_infos(ids)` must return
-    {token_id: {"price": usd|None, "decimals": int}} (pricing.py provides it).
-    Never raises: any failure just leaves that LP unvalued."""
-    budget = Budget()
-    cache: dict = {}
+    """{lp_identifier: {"usd": unit price, "adapter": label, "supply": n}} for the
+    LP tokens among `candidates` that could be valued. `fetch_infos(ids)` must
+    return {token_id: {"price": usd|None, "decimals": int}} (pricing.py
+    provides it). `on_progress(done, total, valued)` is optional.
+    Never raises: any failure just leaves that LP unvalued. When a pass runs out
+    of budget, up to MAX_PASSES passes continue with the LP tokens left over."""
+    lc = _CACHE
+    ordered = list(dict.fromkeys(c for c in candidates if _TOKEN_ID_RE.fullmatch(str(c))))[:MAX_LP_TOKENS]
+    unreadable = [lp for lp in ordered if lc.is_failed(lp)]
+    # known pools first (cheap, certain), then the unexamined ones, in given order
+    todo = sorted((lp for lp in ordered if not lc.is_failed(lp)), key=lambda lp: 0 if lc.good(lp) else 1)
+    stats = LAST_STATS
+    stats.update(candidates=len(set(candidates)), examined=0, valued=0, stopped=False,
+                 unreadable=len(unreadable), remaining=0)
     found: list[tuple[str, dict, PoolState]] = []
-    ordered = list(dict.fromkeys(candidates))[:MAX_LP_TOKENS]
-    for lp in ordered:
-        if not _TOKEN_ID_RE.fullmatch(lp):
-            continue
-        try:
-            res = discover_pool(lp, budget, cache)
-        except Exception:  # noqa: BLE001 - hostile data must never abort the pricing run
+    total = len(todo)
+    for _ in range(MAX_PASSES):
+        if not todo:
+            break
+        budget = Budget()
+        cache: dict = {}
+        remaining: list[str] = []
+        for i, lp in enumerate(todo):
+            if _global_exhausted(budget):
+                remaining = todo[i:]
+                break
+            transient = False
             res = None
-        if res:
-            found.append((lp, res[0], res[1]))
+            try:
+                res = discover_pool(lp, budget, cache)
+            except Exception:  # noqa: BLE001 - hostile data must never abort the run
+                transient = True
+            if transient:
+                if _global_exhausted(budget):
+                    remaining = todo[i:]  # this LP was cut off: redo it first next pass
+                    break
+                remaining.append(lp)      # outage / rate limit: try again next pass
+            else:
+                stats["examined"] += 1
+                if res:
+                    found.append((lp, res[0], res[1]))
+                else:
+                    lc.put_fail(lp)
+            if on_progress:
+                try:
+                    on_progress(total - len(todo) + i + 1 - len(remaining), total, len(found))
+                except Exception:  # noqa: BLE001
+                    pass
+        lc.save()
+        todo = remaining
+    stats["remaining"] = len(todo)
+    stats["stopped"] = bool(todo) or len(set(candidates)) > len(ordered)
+    lc.save()
     if not found:
         return {}
     ids = {t for _, _, st in found for t in st.reserves}
@@ -607,4 +789,5 @@ def price_lp_tokens(candidates: list[str], fetch_infos) -> dict[str, dict]:
             if not st.verified:
                 label += ", contrat non vérifié"
             out[lp] = {"usd": price, "adapter": label, "supply": supply}
+    stats["valued"] = len(out)
     return out

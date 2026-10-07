@@ -268,6 +268,10 @@ def _price_token(
             tok.eur_value = tok.amount * eur
 
 
+#: human-readable notes about the last apply_pricing run (shown by CLI / app).
+LAST_NOTES: list[str] = []
+
+
 def lp_pricing_enabled() -> bool:
     return os.environ.get("WALLET_LP_PRICING", "1") != "0"
 
@@ -285,13 +289,14 @@ def _price_lp(tok: TokenBalance, lp: dict, usd_eur_rate: float | None) -> None:
     tok.name = f"{tok.name} · LP valorisé via {lp['adapter']}"[:300]
 
 
-def apply_pricing(results: list[WalletBalance]) -> bool:
+def apply_pricing(results: list[WalletBalance], on_progress=None) -> bool:
     """Mutate `results` in place, filling in usd_value/eur_value on every
     native balance and token/staking entry, plus each wallet's totals.
 
     Returns False when no native price could be fetched at all (CoinGecko
     down / rate-limited): callers must then NOT hide "unpriced" lines, they
     are simply not priced yet."""
+    LAST_NOTES.clear()
     chain_ids = {w.chain for w in results if not w.error}
     native_prices = _fetch_native_prices(chain_ids)
 
@@ -342,7 +347,13 @@ def apply_pricing(results: list[WalletBalance]) -> bool:
                     held[tok.contract] = held.get(tok.contract, 0.0) + tok.amount
         lp_candidates = sorted(held, key=lambda k: -held[k])
         if lp_candidates:
-            lp_prices = lp_module.price_lp_tokens(lp_candidates, _fetch_token_info)
+            lp_prices = lp_module.price_lp_tokens(lp_candidates, _fetch_token_info, on_progress)
+            st = lp_module.LAST_STATS
+            if st.get("stopped") or st.get("valued", 0) < st.get("candidates", 0):
+                LAST_NOTES.append(
+                    f"LP : {st.get('valued', 0)} valorisé(s) sur {st.get('candidates', 0)} détecté(s)"
+                    + (f" · {st['remaining']} restant(s), relancez pour continuer" if st.get("stopped") else "")
+                )
 
     for w in results:
         if w.error:
