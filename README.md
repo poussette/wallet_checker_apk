@@ -54,6 +54,18 @@ même méthode), Actions recompile automatiquement, tu retélécharges le
 nouvel APK et le réinstalles par-dessus (Android garde tes paramètres tant
 que le `package.name` dans `buildozer.spec` ne change pas).
 
+## LP tokens (MultiversX)
+
+Les LP tokens des DEX autres que xExchange n'ont pas de prix public. L'outil les valorise en lisant le **contrat de la pool** (requête `vm-values/query` sur une passerelle MultiversX) : `prix du LP = valeur des réserves ÷ quantité totale de LP`.
+
+- **Nœud personnalisé** : `--mvx-gateway https://mon.noeud` (CLI), variable `MULTIVERSX_GATEWAY_URL`, ou le champ « Nœud MultiversX » de l'app. Vide = passerelle publique `https://gateway.multiversx.com`. Seul `https://` est accepté. `--no-lp` (ou la case de l'app) désactive la fonction.
+- **Trouver la pool** : l'émetteur d'un LP est souvent un routeur/une factory, pas la pool. On interroge donc `/tokens/<LP>/roles` : le contrat qui détient les droits de mint/burn du LP est la pool (puis l'émetteur en dernier recours). Aucun code propre à un DEX pour cette étape.
+- **Lire la pool** : un contrat ne publie pas son ABI. Chaque adaptateur (`ADAPTERS` dans `providers/lp.py`) liste des *noms de vues candidats* : `xexchange-pair`, `jex-pair`, `onedex` (un seul contrat, vues indexées par un id de paire), `list-pool` (AshSwap et pools à liste de jetons ; sans vue de réserves, les soldes du contrat servent de réserves).
+- **Garde-fous** : un résultat n'est retenu que si la pool **nomme elle-même ce LP** (obligatoire), chaque réserve est ≤ au solde réel du contrat, et la quantité totale de la pool concorde avec `minted - burnt`. Une mauvaise hypothèse donne « non valorisé », jamais une valeur fausse.
+- **Valorisation** : si tous les jetons de la pool ont un prix, on additionne ; si un seul des deux (pool 50/50 à produit constant), on double et la ligne indique « estimation 50/50 » ; pools stables / à plus de 2 jetons : tous les jetons doivent avoir un prix. Les pools stables sans vue de réserves utilisent les soldes du contrat, qui peuvent inclure des frais non distribués : écart de quelques % possible.
+- **Un DEX n'est pas reconnu ?** `python lp_probe.py <LP-id>` affiche les contrats candidats et les vues qui répondent. Ajoutez ensuite un dictionnaire à `ADAPTERS` (données seulement), ou envoyez la sortie pour qu'on l'écrive. Non géré à ce jour : la découverte automatique des vues à partir du bytecode.
+- **Limites** : budget de 300 requêtes et 40 LP par actualisation ; le prix des jetons de la pool vient toujours de xExchange. **Contrats non reconnus** : n'importe qui peut déployer un contrat qui répond « comme une pool » avec des chiffres inventés. Seuls les contrats dont le *code hash* a été observé sur les vraies pools du DEX (`code_hashes` dans `ADAPTERS`) sont « vérifiés » ; un autre contrat cohérent est valorisé seulement si **tous** ses jetons ont un prix, jamais par doublement 50/50, et la ligne indique « contrat non vérifié ». Une position supérieure à la quantité totale du LP, ou à 50 M$, n'est jamais valorisée. Gardez un œil critique sur ces lignes : c'est une estimation tirée de la chaîne, pas un prix de marché.
+
 ## Sécurité
 
 **Ce qui est protégé** (audit v0.5) :

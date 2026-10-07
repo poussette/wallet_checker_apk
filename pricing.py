@@ -25,11 +25,14 @@ address, its platform id to TOKEN_PLATFORM_IDS.
 
 from __future__ import annotations
 
+import os
+
 import requests
 
 from providers.base import TokenBalance, WalletBalance
 from providers.net import request_json
-from providers.safe import MAX_POSITION_USD, safe_price
+from providers import lp as lp_module
+from providers.safe import MAX_POSITION_USD, safe_decimals, safe_price
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 MULTIVERSX_API = "https://api.multiversx.com"
@@ -192,14 +195,14 @@ def _fetch_mex_tokens_prices() -> dict[str, float]:
     return prices
 
 
-def _fetch_token_prices_by_identifier(identifiers: set[str]) -> dict[str, float]:
-    """Return {esdt_identifier: usd_price} for exactly the given identifiers,
-    via MultiversX's general /tokens endpoint (prices any token with known
-    DEX liquidity, not just the narrower "MEX economics" set)."""
+def _fetch_token_info(identifiers: set[str]) -> dict[str, dict]:
+    """{esdt_identifier: {"price": usd|None, "decimals": int|None}} via
+    MultiversX's general /tokens endpoint (prices any token with known DEX
+    liquidity, not just the narrower "MEX economics" set)."""
     if not identifiers:
         return {}
-    prices: dict[str, float] = {}
-    ids_list = list(identifiers)
+    info: dict[str, dict] = {}
+    ids_list = sorted(identifiers)
     chunk_size = 50
     for i in range(0, len(ids_list), chunk_size):
         chunk = ids_list[i : i + chunk_size]
@@ -217,10 +220,19 @@ def _fetch_token_prices_by_identifier(identifiers: set[str]) -> dict[str, float]
             if not isinstance(tok, dict):
                 continue
             identifier = tok.get("identifier")
-            price = safe_price(tok.get("price"))
-            if isinstance(identifier, str) and price is not None:
-                prices[identifier] = price
-    return prices
+            if isinstance(identifier, str):
+                info[identifier] = {
+                    "price": safe_price(tok.get("price")),
+                    "decimals": safe_decimals(tok.get("decimals")),
+                }
+    return info
+
+
+def _fetch_token_prices_by_identifier(identifiers: set[str]) -> dict[str, float]:
+    """{esdt_identifier: usd_price} for exactly the given identifiers."""
+    return {
+        k: v["price"] for k, v in _fetch_token_info(identifiers).items() if v["price"] is not None
+    }
 
 
 def _price_token(
@@ -256,6 +268,23 @@ def _price_token(
             tok.eur_value = tok.amount * eur
 
 
+def lp_pricing_enabled() -> bool:
+    return os.environ.get("WALLET_LP_PRICING", "1") != "0"
+
+
+def _price_lp(tok: TokenBalance, lp: dict, usd_eur_rate: float | None) -> None:
+    usd = tok.amount * lp["usd"]
+    if usd > lp_module.LP_MAX_POSITION_USD:
+        return
+    if lp.get("supply") and tok.amount > lp["supply"] * 1.001:
+        return  # holding more than the whole supply: the metadata is lying
+    tok.usd_value = usd
+    if usd_eur_rate is not None:
+        tok.eur_value = usd * usd_eur_rate
+    # make the origin visible: it is derived from pool reserves, not a market price
+    tok.name = f"{tok.name} · LP valorisé via {lp['adapter']}"[:300]
+
+
 def apply_pricing(results: list[WalletBalance]) -> bool:
     """Mutate `results` in place, filling in usd_value/eur_value on every
     native balance and token/staking entry, plus each wallet's totals.
@@ -288,12 +317,32 @@ def apply_pricing(results: list[WalletBalance]) -> bool:
     # set, then a targeted pass for whatever's still missing a price.
     xexchange_prices: dict[str, float] = {}
     usd_eur_rate: float | None = None
+    lp_prices: dict[str, dict] = {}
     if multiversx_identifiers:
         xexchange_prices = _fetch_mex_tokens_prices()
         still_unpriced = multiversx_identifiers - xexchange_prices.keys()
         if still_unpriced:
             xexchange_prices.update(_fetch_token_prices_by_identifier(still_unpriced))
         usd_eur_rate = _fetch_usd_eur_rate()
+
+    # LP tokens of other DEXs (AshSwap, JEX, OneDex...) have no public price:
+    # value them from their pool's reserves, read straight from the contract.
+    if multiversx_identifiers and lp_pricing_enabled():
+        # most held first, so the per-run limits spare real positions over spam
+        held: dict[str, float] = {}
+        for w in results:
+            for tok in w.tokens:
+                if (
+                    w.chain == "multiversx"
+                    and tok.asset_type in CONTRACT_PRICED_TYPES
+                    and tok.contract
+                    and tok.contract not in xexchange_prices
+                    and lp_module.looks_like_lp(tok.symbol, tok.name)
+                ):
+                    held[tok.contract] = held.get(tok.contract, 0.0) + tok.amount
+        lp_candidates = sorted(held, key=lambda k: -held[k])
+        if lp_candidates:
+            lp_prices = lp_module.price_lp_tokens(lp_candidates, _fetch_token_info)
 
     for w in results:
         if w.error:
@@ -320,6 +369,8 @@ def apply_pricing(results: list[WalletBalance]) -> bool:
             _price_token(
                 tok, w.chain, native_price, token_prices, xexchange_prices, usd_eur_rate
             )
+            if tok.usd_value is None and w.chain == "multiversx" and tok.contract in lp_prices:
+                _price_lp(tok, lp_prices[tok.contract], usd_eur_rate)
             if tok.usd_value is not None:
                 total_usd += tok.usd_value
                 has_any_price = True

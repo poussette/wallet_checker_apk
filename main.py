@@ -49,9 +49,9 @@ from kivy.uix.widget import Widget
 from kivy.utils import escape_markup, platform
 
 import report
-from providers.safe import clean_text, safe_error
+from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.7"
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
 # Monospace font shipped with Kivy (used for the config editor).
@@ -82,6 +82,8 @@ DEFAULT_SETTINGS = {
     "show_unpriced": False,
     "show_dust": False,
     "secure_screen": False,
+    "lp_pricing": True,
+    "mvx_gateway": "",
 }
 
 #: limits on what a (possibly corrupted/tampered) settings file or a huge
@@ -106,7 +108,10 @@ def sanitize_settings(raw) -> dict:
             # (newline, control chars...) would be a header/URL injection.
             v = "".join(ch for ch in v.strip() if 33 <= ord(ch) < 127)
             out[k] = v[:MAX_KEY_CHARS]
-    for k in ("show_unpriced", "show_dust", "secure_screen"):
+    gw = raw.get("mvx_gateway")
+    if isinstance(gw, str) and (not gw.strip() or validate_rpc_url(gw.strip())):
+        out["mvx_gateway"] = gw.strip()[:MAX_KEY_CHARS]  # empty = public default
+    for k in ("show_unpriced", "show_dust", "secure_screen", "lp_pricing"):
         if isinstance(raw.get(k), bool):
             out[k] = raw[k]
     return out
@@ -654,6 +659,23 @@ class WalletCheckerApp(App):
         ))
         content.add_widget(dust_row)
 
+        gw_row = BoxLayout(size_hint=(1, None), height=dp(48), spacing=dp(8))
+        gw_row.add_widget(WrapLabel(text="Nœud MultiversX (vide = public)", size_hint=(0.5, 1), font_size=sp(12)))
+        gw_input = style_input(TextInput(
+            text=self.settings.get("mvx_gateway", ""), multiline=False, size_hint=(0.5, 1),
+            hint_text="https://gateway.multiversx.com",
+        ))
+        gw_row.add_widget(gw_input)
+        content.add_widget(gw_row)
+
+        lp_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        lp_checkbox = CheckBox(active=self.settings.get("lp_pricing", True), size_hint=(None, 1), width=dp(44))
+        lp_row.add_widget(lp_checkbox)
+        lp_row.add_widget(WrapLabel(
+            text="Valoriser les LP tokens via les contrats (plus lent)", size_hint=(1, 1), font_size=sp(12),
+        ))
+        content.add_widget(lp_row)
+
         secure_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
         secure_checkbox = CheckBox(active=self.settings.get("secure_screen", False), size_hint=(None, 1), width=dp(44))
         secure_row.add_widget(secure_checkbox)
@@ -679,10 +701,16 @@ class WalletCheckerApp(App):
                 "show_unpriced": unpriced_checkbox.active,
                 "show_dust": dust_checkbox.active,
                 "secure_screen": secure_checkbox.active,
+                "lp_pricing": lp_checkbox.active,
+                "mvx_gateway": gw_input.text.strip(),
             })
+            gw_rejected = bool(gw_input.text.strip()) and not self.settings.get("mvx_gateway")
             self._apply_secure_screen(self.settings["secure_screen"])
             popup.dismiss()
-            self.status_label.text = "Configuration enregistrée. Appuie sur Actualiser."
+            self.status_label.text = (
+                "Nœud MultiversX ignoré (https:// requis) ; le reste est enregistré."
+                if gw_rejected else "Configuration enregistrée. Appuie sur Actualiser."
+            )
 
         save_btn.bind(on_release=do_save)
         cancel_btn.bind(on_release=lambda _b: popup.dismiss())
@@ -735,6 +763,8 @@ class WalletCheckerApp(App):
         try:
             os.environ["ETHERSCAN_API_KEY"] = self.settings.get("etherscan_key", "") or ""
             os.environ["BEACONCHAIN_API_KEY"] = self.settings.get("beacon_key", "") or ""
+            os.environ["MULTIVERSX_GATEWAY_URL"] = self.settings.get("mvx_gateway", "") or ""
+            os.environ["WALLET_LP_PRICING"] = "1" if self.settings.get("lp_pricing", True) else "0"
 
             def progress(done, total):
                 Clock.schedule_once(
