@@ -1,0 +1,12 @@
+# Your real wallet list and any result are private: never commit them.
+addresses.txt
+wallets*.txt
+*.private.txt
+result*.json
+result*.csv
+results*/
+*.keystore
+*.jks
+.env
+__pycache__/
+*.pyc

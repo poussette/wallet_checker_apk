@@ -4,12 +4,16 @@ package.name = walletchecker
 package.domain = org.walletchecker
 source.dir = .
 source.include_exts = py
-version = 0.4
+version = 0.5
 requirements = python3,kivy,requests,certifi,urllib3,idna,charset_normalizer
 orientation = portrait
 fullscreen = 0
 
 android.permissions = INTERNET
+
+# Security: keep the app's private data (wallet list, API keys) out of
+# Android cloud/adb backups.
+android.allow_backup = False
 android.api = 33
 android.minapi = 21
 # Both ABIs on purpose: arm64-v8a for modern phones, armeabi-v7a for older

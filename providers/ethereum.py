@@ -32,20 +32,31 @@ import re
 import requests
 
 from .base import BaseProvider, TokenBalance, WalletBalance
+from .net import request_json
+from .safe import (
+    MAX_AMOUNT,
+    MAX_ENTRIES,
+    clean_text,
+    safe_decimals,
+    safe_error,
+    validate_rpc_url,
+)
 
 # Several free public RPC endpoints, tried in order. Public RPCs are
 # rate-limited and occasionally flaky, so a single endpoint isn't reliable
-# enough on its own. If ETH_RPC_URL is set, it's tried first.
+# enough on its own. If ETH_RPC_URL is set (and is https), it's tried first.
 _DEFAULT_RPCS = [
     "https://eth.llamarpc.com",
     "https://ethereum-rpc.publicnode.com",
     "https://rpc.ankr.com/eth",
     "https://cloudflare-eth.com",
 ]
+
+
 def _public_rpcs() -> list[str]:
     # Read lazily (not at import time) so a caller (e.g. a GUI app) can
     # change these env vars at runtime and have it take effect immediately.
-    env_rpc = os.environ.get("ETH_RPC_URL")
+    env_rpc = validate_rpc_url(os.environ.get("ETH_RPC_URL"))
     return [env_rpc] + _DEFAULT_RPCS if env_rpc else _DEFAULT_RPCS
 
 
@@ -62,10 +73,33 @@ BEACONCHAIN_API = "https://beaconcha.in/api/v1"
 def _beacon_key() -> str:
     return os.environ.get("BEACONCHAIN_API_KEY", "")
 
+
 _ETH_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+_HEX_RE = re.compile(r"^0x[0-9a-fA-F]{1,80}$")
 
 # ERC-20 balanceOf(address) selector
 _BALANCE_OF_SELECTOR = "0x70a08231"
+
+#: never query more contracts than this per address (a spam-airdropped
+#: address can have thousands; each one costs an RPC call).
+MAX_TOKEN_CONTRACTS = 150
+_BEACON_CHUNK = 100
+
+
+def _hex_to_int(raw) -> int | None:
+    """Parse a 0x-prefixed hex quantity coming from an RPC; None if invalid."""
+    if not isinstance(raw, str) or not _HEX_RE.match(raw):
+        return None
+    return int(raw, 16)
+
+
+def _scaled(value: int, decimals: int) -> float:
+    """value / 10**decimals without ever overflowing (decimals is clamped
+    by the caller, and the result is range-checked by sanitize_wallet)."""
+    try:
+        return value / (10**decimals)
+    except OverflowError:
+        return float("inf")  # dropped later by safe_amount
 
 
 class EthereumProvider(BaseProvider):
@@ -77,36 +111,37 @@ class EthereumProvider(BaseProvider):
     def matches(cls, address: str) -> bool:
         return bool(_ETH_RE.match(address.strip()))
 
+    truncated_contracts = False
+
     def _rpc_call(self, method: str, params: list) -> dict:
         """Try each configured RPC endpoint until one returns a valid result."""
-        last_error: Exception | None = None
+        last_error = "no endpoint"
         for endpoint in _public_rpcs():
             payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
             try:
-                resp = requests.post(endpoint, json=payload, timeout=15)
-                resp.raise_for_status()
-                data = resp.json()
-            except (requests.RequestException, ValueError) as exc:
-                last_error = exc
+                data = request_json(
+                    "POST", endpoint, json_body=payload, allow_loopback_http=True
+                )
+            except requests.RequestException as exc:
+                last_error = safe_error(exc)
+                continue
+            if not isinstance(data, dict):
+                last_error = "unexpected response format"
                 continue
             if "error" in data:
-                last_error = RuntimeError(
-                    f"{endpoint} returned RPC error: {data['error']}"
-                )
+                last_error = f"RPC error: {safe_error(data['error'])}"
                 continue
             if "result" not in data:
-                last_error = RuntimeError(
-                    f"{endpoint} returned unexpected response: {data}"
-                )
+                last_error = "unexpected response (no result)"
                 continue
             return data
-        raise RuntimeError(
-            f"All RPC endpoints failed for {method}. Last error: {last_error}"
-        )
+        raise RuntimeError(f"All RPC endpoints failed for {method}. Last error: {last_error}")
 
     def _get_native_balance(self, address: str) -> float:
         result = self._rpc_call("eth_getBalance", [address, "latest"])
-        wei = int(result["result"], 16)
+        wei = _hex_to_int(result["result"])
+        if wei is None:
+            raise ValueError("invalid balance returned by RPC")
         return wei / 1e18
 
     def _discover_token_contracts(self, address: str) -> dict[str, dict]:
@@ -118,23 +153,33 @@ class EthereumProvider(BaseProvider):
             "sort": "desc",
             "apikey": _etherscan_key(),
         }
-        resp = requests.get(ETHERSCAN_API, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
+        data = request_json("GET", ETHERSCAN_API, params=params)
+        if not isinstance(data, dict):
+            raise requests.RequestException("unexpected Etherscan response")
+        result = data.get("result")
+        if not isinstance(result, list):
+            # Etherscan answers {"status":"0","result":"Invalid API Key"} etc.
+            # (an empty history is an empty *list*): surface it, don't hide it.
+            raise requests.RequestException(
+                f"Etherscan: {clean_text(data.get('message') or result, 120)}"
+            )
         contracts: dict[str, dict] = {}
-        for tx in data.get("result", []) or []:
+        for tx in result:
             if not isinstance(tx, dict):
                 continue
             contract = tx.get("contractAddress")
-            if not contract or contract in contracts:
+            # the contract goes into an eth_call: it must be a real address
+            if not isinstance(contract, str) or not _ETH_RE.match(contract):
                 continue
-            try:
-                decimals = int(tx.get("tokenDecimal", "18"))
-            except ValueError:
-                decimals = 18
+            if contract in contracts:
+                continue
+            if len(contracts) >= MAX_TOKEN_CONTRACTS:
+                self.truncated_contracts = True
+                break
+            decimals = safe_decimals(tx.get("tokenDecimal", "18"), default=18)
             contracts[contract] = {
-                "symbol": tx.get("tokenSymbol", "?"),
-                "name": tx.get("tokenName", "Unknown token"),
+                "symbol": clean_text(tx.get("tokenSymbol"), 40) or "?",
+                "name": clean_text(tx.get("tokenName"), 120) or "Unknown token",
                 "decimals": decimals,
             }
         return contracts
@@ -145,40 +190,41 @@ class EthereumProvider(BaseProvider):
         result = self._rpc_call(
             "eth_call", [{"to": contract, "data": data}, "latest"]
         )
-        raw = result.get("result", "0x0")
-        try:
-            value = int(raw, 16)
-        except (ValueError, TypeError):
+        value = _hex_to_int(result.get("result", "0x0"))
+        if value is None:
             return 0.0
-        return value / (10**decimals)
+        return _scaled(value, decimals)
 
     def _get_beacon_validators(self, address: str) -> list[dict]:
         """Return raw validator dicts (pubkey, index) linked to this address
         as depositor or 0x01 withdrawal-credential recipient."""
         params = {"apikey": _beacon_key()} if _beacon_key() else {}
-        resp = requests.get(
-            f"{BEACONCHAIN_API}/validator/eth1/{address}", params=params, timeout=15
+        data = request_json(
+            "GET", f"{BEACONCHAIN_API}/validator/eth1/{address}", params=params
         )
-        resp.raise_for_status()
-        data = resp.json()
-        result = data.get("data", [])
+        result = data.get("data", []) if isinstance(data, dict) else []
         if isinstance(result, dict):  # API returns a dict for a single match
             result = [result]
-        return result or []
+        if not isinstance(result, list):
+            return []
+        return [v for v in result if isinstance(v, dict)][:MAX_ENTRIES]
 
     def _get_beacon_balances(self, indices: list[int]) -> list[dict]:
         """Return {publicvalidatorindex/pubkey, balance (Gwei), status} for
-        each validator index, batched into one call."""
+        each validator index, batched (chunks of 100, the API maximum)."""
         params = {"apikey": _beacon_key()} if _beacon_key() else {}
-        ids = ",".join(str(i) for i in indices)
-        resp = requests.get(
-            f"{BEACONCHAIN_API}/validator/{ids}", params=params, timeout=15
-        )
-        resp.raise_for_status()
-        data = resp.json().get("data", [])
-        if isinstance(data, dict):
-            data = [data]
-        return data or []
+        out: list[dict] = []
+        for i in range(0, len(indices), _BEACON_CHUNK):
+            ids = ",".join(str(x) for x in indices[i : i + _BEACON_CHUNK])
+            data = request_json(
+                "GET", f"{BEACONCHAIN_API}/validator/{ids}", params=params
+            )
+            data = data.get("data", []) if isinstance(data, dict) else []
+            if isinstance(data, dict):
+                data = [data]
+            if isinstance(data, list):
+                out.extend(v for v in data if isinstance(v, dict))
+        return out
 
     def get_balance(self, address: str) -> WalletBalance:
         address = address.strip()
@@ -189,10 +235,12 @@ class EthereumProvider(BaseProvider):
         try:
             wallet.native_amount = self._get_native_balance(address)
         except (requests.RequestException, RuntimeError, KeyError, ValueError) as exc:
-            wallet.error = f"RPC error: {exc}"
+            wallet.error = f"RPC error: {safe_error(exc)}"
             return wallet
 
         warnings: list[str] = []
+        if os.environ.get("ETH_RPC_URL") and not validate_rpc_url(os.environ.get("ETH_RPC_URL")):
+            warnings.append("ETH_RPC_URL ignored (must be https)")
 
         # ERC-20 tokens (needs Etherscan key to discover which contracts to check).
         if not _etherscan_key():
@@ -203,9 +251,13 @@ class EthereumProvider(BaseProvider):
             try:
                 contracts = self._discover_token_contracts(address)
             except requests.RequestException as exc:
-                warnings.append(f"Etherscan error, tokens skipped: {exc}")
+                warnings.append(f"Etherscan error, tokens skipped: {safe_error(exc)}")
                 contracts = {}
 
+            if self.truncated_contracts:
+                warnings.append(
+                    f"only the {MAX_TOKEN_CONTRACTS} most recent token contracts were checked"
+                )
             for contract, meta in contracts.items():
                 try:
                     amount = self._get_token_balance(
@@ -230,7 +282,9 @@ class EthereumProvider(BaseProvider):
             indices = [
                 v["validatorindex"]
                 for v in validators
-                if v.get("validatorindex") is not None
+                if isinstance(v.get("validatorindex"), int)
+                and not isinstance(v.get("validatorindex"), bool)
+                and 0 <= v["validatorindex"] < 10**9
             ]
             if indices:
                 balances = self._get_beacon_balances(indices)
@@ -241,19 +295,21 @@ class EthereumProvider(BaseProvider):
                         continue
                     if gwei <= 0:
                         continue
-                    idx = v.get("validatorindex", "?")
-                    status = v.get("status", "unknown")
+                    if gwei > MAX_AMOUNT:
+                        continue
+                    idx = clean_text(v.get("validatorindex", "?"), 12)
+                    status = clean_text(v.get("status", "unknown"), 30)
                     wallet.tokens.append(
                         TokenBalance(
                             symbol=self.native_symbol,
                             name=f"Staked {self.native_symbol} (validator #{idx}, {status})",
                             amount=gwei / 1e9,
-                            contract=v.get("pubkey"),
+                            contract=clean_text(v.get("pubkey"), 120) or None,
                             asset_type="beacon-stake",
                         )
                     )
         except requests.RequestException as exc:
-            warnings.append(f"could not fetch beacon-chain staking: {exc}")
+            warnings.append(f"could not fetch beacon-chain staking: {safe_error(exc)}")
 
         if warnings:
             wallet.warning = "; ".join(warnings)

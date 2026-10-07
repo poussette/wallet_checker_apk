@@ -8,10 +8,13 @@ of scope here), so `tokens` is always empty.
 from __future__ import annotations
 
 import re
+from urllib.parse import quote
 
 import requests
 
 from .base import BaseProvider, WalletBalance
+from .net import request_json
+from .safe import safe_error
 
 BLOCKSTREAM_API = "https://blockstream.info/api"
 
@@ -33,27 +36,28 @@ class BitcoinProvider(BaseProvider):
     def get_balance(self, address: str) -> WalletBalance:
         address = address.strip()
         try:
-            resp = requests.get(f"{BLOCKSTREAM_API}/address/{address}", timeout=15)
-            resp.raise_for_status()
-            data = resp.json()
-        except requests.RequestException as exc:
+            # `address` already passed matches() (strict charset), but quote
+            # anyway so it can never alter the URL path/query.
+            data = request_json("GET", f"{BLOCKSTREAM_API}/address/{quote(address, safe='')}")
+            if not isinstance(data, dict):
+                raise requests.RequestException("unexpected response format")
+            chain_stats = data.get("chain_stats") or {}
+            mempool_stats = data.get("mempool_stats") or {}
+            funded = int(chain_stats.get("funded_txo_sum", 0)) + int(
+                mempool_stats.get("funded_txo_sum", 0)
+            )
+            spent = int(chain_stats.get("spent_txo_sum", 0)) + int(
+                mempool_stats.get("spent_txo_sum", 0)
+            )
+        except (requests.RequestException, ValueError, TypeError, AttributeError) as exc:
             return WalletBalance(
                 chain=self.chain_id,
                 address=address,
                 native_symbol=self.native_symbol,
-                error=f"API error: {exc}",
+                error=f"API error: {safe_error(exc)}",
             )
 
-        chain_stats = data.get("chain_stats", {})
-        mempool_stats = data.get("mempool_stats", {})
-        funded = chain_stats.get("funded_txo_sum", 0) + mempool_stats.get(
-            "funded_txo_sum", 0
-        )
-        spent = chain_stats.get("spent_txo_sum", 0) + mempool_stats.get(
-            "spent_txo_sum", 0
-        )
-        balance_sats = funded - spent
-        balance_btc = balance_sats / 1e8
+        balance_btc = max(funded - spent, 0) / 1e8
 
         return WalletBalance(
             chain=self.chain_id,

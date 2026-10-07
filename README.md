@@ -53,3 +53,20 @@ fichiers modifiés, tu les remplaces dans ton dépôt GitHub (upload à nouveau,
 même méthode), Actions recompile automatiquement, tu retélécharges le
 nouvel APK et le réinstalles par-dessus (Android garde tes paramètres tant
 que le `package.name` dans `buildozer.spec` ne change pas).
+
+## Sécurité
+
+**Ce qui est protégé** (audit v0.5) :
+- Toutes les données reçues des API sont traitées comme hostiles (tokens airdrop avec noms piégés, décimales absurdes, montants NaN/inf, réponses géantes) : texte nettoyé (séquences d'échappement, caractères bidi/invisibles), nombres bornés, taille de réponse et nombre de pages plafonnés.
+- Les clés API ne fuient plus dans les messages d'erreur, les exports ou le presse-papier (les erreurs `requests` contiennent l'URL complète, donc la clé : elles sont masquées).
+- HTTPS uniquement (un RPC personnalisé en `http://` est ignoré, hors `localhost`) ; la vérification TLS n'est jamais désactivée ; les redirections vers HTTP sont refusées.
+- Les adresses sont validées (même quand la chaîne est forcée) et encodées avant d'entrer dans une URL.
+- Les exports CSV neutralisent l'injection de formules (`=`, `+`, `-`, `@`) ; les fichiers de sortie du CLI sont créés en `0600`.
+- Un token dont la valeur dépasse 1 milliard de $ est considéré comme un artefact de prix et laissé non valorisé.
+
+**À savoir (risques résiduels)** :
+- Ta liste d'adresses et tes clés sont stockées en clair dans le stockage privé de l'app (isolé des autres apps, hors sauvegardes). Un téléphone rooté ou déverrouillé y accède.
+- Les services tiers (Blockstream, CoinGecko, RPC publics...) voient tes adresses et ton IP. Utilise ton propre RPC si c'est un sujet.
+- Un faux token airdroppé dans un pool très peu liquide peut afficher une valeur gonflée mais < 1 Md$ : méfie-toi des lignes de tokens inconnus.
+- L'APK est signé avec une clé *debug* générée à chaque build : Android considère chaque build comme un éditeur différent (désinstalle avant de réinstaller). Ne distribue pas ce fichier.
+- Ne commite jamais ta vraie liste : `addresses.txt`, `wallets*.txt` et les exports sont dans `.gitignore`. Vérifie avec `git ls-files`.

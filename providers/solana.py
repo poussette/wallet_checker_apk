@@ -55,6 +55,8 @@ import re
 import requests
 
 from .base import BaseProvider, TokenBalance, WalletBalance
+from .net import request_json
+from .safe import MAX_ENTRIES, clean_text, safe_amount, safe_error, validate_rpc_url
 
 _DEFAULT_SOLANA_RPC = "https://api.mainnet-beta.solana.com"
 
@@ -63,7 +65,7 @@ def _public_rpc() -> str:
     # Read lazily (not at import time) so a caller (e.g. a GUI app) can
     # change SOLANA_RPC_URL at runtime, after this module has already been
     # imported, and have it take effect on the next lookup.
-    return os.environ.get("SOLANA_RPC_URL", _DEFAULT_SOLANA_RPC)
+    return validate_rpc_url(os.environ.get("SOLANA_RPC_URL")) or _DEFAULT_SOLANA_RPC
 JUPITER_TOKEN_LIST = "https://token.jup.ag/all"
 SPL_TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 STAKE_PROGRAM_ID = "Stake11111111111111111111111111111111111111"
@@ -93,11 +95,13 @@ def _load_token_list() -> dict[str, dict]:
     if _token_list_cache is not None:
         return _token_list_cache
     try:
-        resp = requests.get(JUPITER_TOKEN_LIST, timeout=15)
-        resp.raise_for_status()
-        tokens = resp.json()
-        _token_list_cache = {t["address"]: t for t in tokens}
-    except (requests.RequestException, ValueError, KeyError):
+        tokens = request_json("GET", JUPITER_TOKEN_LIST, max_bytes=30_000_000)
+        _token_list_cache = {
+            t["address"]: t
+            for t in tokens
+            if isinstance(t, dict) and isinstance(t.get("address"), str)
+        }
+    except (requests.RequestException, ValueError, KeyError, TypeError):
         _token_list_cache = {}
     return _token_list_cache
 
@@ -117,9 +121,13 @@ class SolanaProvider(BaseProvider):
 
     def _rpc_call(self, method: str, params: list) -> dict:
         payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
-        resp = requests.post(_public_rpc(), json=payload, timeout=15)
-        resp.raise_for_status()
-        return resp.json()
+        data = request_json(
+            "POST", _public_rpc(), json_body=payload, max_bytes=30_000_000,
+            allow_loopback_http=True,
+        )
+        if not isinstance(data, dict):
+            raise requests.RequestException("unexpected RPC response format")
+        return data
 
     def _get_current_epoch(self) -> int | None:
         try:
@@ -137,12 +145,12 @@ class SolanaProvider(BaseProvider):
         try:
             result = self._rpc_call("getBalance", [address])
             if "error" in result:
-                wallet.error = f"RPC error: {result['error']}"
+                wallet.error = f"RPC error: {safe_error(result['error'])}"
                 return wallet
-            lamports = result["result"]["value"]
+            lamports = int(result["result"]["value"])
             wallet.native_amount = lamports / 1e9
-        except (requests.RequestException, KeyError, TypeError) as exc:
-            wallet.error = f"RPC error: {exc}"
+        except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
+            wallet.error = f"RPC error: {safe_error(exc)}"
             return wallet
 
         try:
@@ -155,25 +163,35 @@ class SolanaProvider(BaseProvider):
                 ],
             )
         except requests.RequestException as exc:
-            wallet.warning = f"Could not fetch SPL tokens: {exc}"
+            wallet.warning = f"Could not fetch SPL tokens: {safe_error(exc)}"
+            return wallet
+        if "error" in token_accounts:
+            wallet.warning = f"Could not fetch SPL tokens: {safe_error(token_accounts['error'])}"
             return wallet
 
         token_list = _load_token_list()
-        for entry in token_accounts.get("result", {}).get("value", []):
+        value_list = (token_accounts.get("result") or {}).get("value", [])
+        if not isinstance(value_list, list):
+            value_list = []
+        if len(value_list) > 2000:
+            wallet.warning = "token list truncated at 2000 accounts"
+        for entry in value_list[:2000]:
             try:
                 info = entry["account"]["data"]["parsed"]["info"]
                 mint = info["mint"]
                 token_amount = info["tokenAmount"]
-                amount = float(token_amount["uiAmountString"] or 0)
+                amount = safe_amount(token_amount["uiAmountString"] or 0)
             except (KeyError, TypeError, ValueError):
                 continue
-            if amount <= 0:
+            if not isinstance(mint, str) or not _SOL_RE.match(mint):
+                continue
+            if not amount:
                 continue
             meta = token_list.get(mint, {})
             wallet.tokens.append(
                 TokenBalance(
-                    symbol=meta.get("symbol", mint[:6] + "…"),
-                    name=meta.get("name", "Unknown SPL token"),
+                    symbol=clean_text(meta.get("symbol"), 40) or (mint[:6] + "…"),
+                    name=clean_text(meta.get("name"), 120) or "Unknown SPL token",
                     amount=amount,
                     contract=mint,
                 )
@@ -197,7 +215,7 @@ class SolanaProvider(BaseProvider):
                 ],
             )
             if "error" in stake_result:
-                _add_warning(f"could not fetch staked SOL: {stake_result['error']}")
+                _add_warning(f"could not fetch staked SOL: {safe_error(stake_result['error'])}")
             else:
                 current_epoch = self._get_current_epoch()
                 if current_epoch is None:
@@ -206,17 +224,20 @@ class SolanaProvider(BaseProvider):
                         "as 'staked' without checking whether they're still active"
                     )
 
-                for entry in stake_result.get("result", []):
+                stake_list = stake_result.get("result", [])
+                if not isinstance(stake_list, list):
+                    stake_list = []
+                for entry in stake_list[:MAX_ENTRIES]:
                     try:
                         parsed = entry["account"]["data"]["parsed"]["info"]
                         stake_info = parsed["stake"]["delegation"]
-                        voter = stake_info.get("voter", "?")
+                        voter = clean_text(stake_info.get("voter", "?"), 60)
                         activation_epoch = int(stake_info.get("activationEpoch", 0))
                         deactivation_epoch = int(
                             stake_info.get("deactivationEpoch", _NEVER_DEACTIVATED)
                         )
-                        withdrawer = parsed.get("meta", {}).get("authorized", {}).get(
-                            "withdrawer", "?"
+                        withdrawer = clean_text(
+                            parsed.get("meta", {}).get("authorized", {}).get("withdrawer", "?"), 60
                         )
                         # Ground truth: the account's real current balance,
                         # not the (possibly stale, post-withdrawal) figure
@@ -230,7 +251,7 @@ class SolanaProvider(BaseProvider):
                         # meaningful position.
                         continue
 
-                    stake_account = entry.get("pubkey", "?")
+                    stake_account = clean_text(entry.get("pubkey", "?"), 60)
 
                     if current_epoch is None:
                         # Can't determine state reliably; default to "staked"
@@ -265,6 +286,6 @@ class SolanaProvider(BaseProvider):
                         )
                     )
         except requests.RequestException as exc:
-            _add_warning(f"could not fetch staked SOL: {exc}")
+            _add_warning(f"could not fetch staked SOL: {safe_error(exc)}")
 
         return wallet

@@ -15,6 +15,16 @@ from typing import Callable
 from pricing import apply_pricing
 from providers import PROVIDERS, detect_provider, get_provider_by_name
 from providers.base import WalletBalance
+from providers.safe import (
+    MAX_ENTRIES,
+    MAX_LINE,
+    clean_text,
+    csv_text,
+    safe_error,
+    sanitize_wallet,
+)
+
+MAX_WORKERS = 16
 
 
 def fmt_money(value: float | None) -> str:
@@ -29,18 +39,26 @@ def parse_input_text(text: str) -> list[tuple[str | None, str | None, str]]:
     entries: list[tuple[str | None, str | None, str]] = []
     current_label: str | None = None
     for raw_line in text.splitlines():
-        line = raw_line.strip()
+        line = raw_line.strip()[:MAX_LINE]
         if not line or line.startswith("#"):
             continue
         if line.startswith("[") and line.endswith("]") and len(line) > 2:
-            current_label = line[1:-1].strip()
+            current_label = clean_text(line[1:-1], 100) or None
             continue
         if "," in line:
             chain, address = line.split(",", 1)
             entries.append((current_label, chain.strip().lower(), address.strip()))
         else:
             entries.append((current_label, None, line))
+        if len(entries) > MAX_ENTRIES:
+            raise ValueError(f"Trop d'adresses (maximum {MAX_ENTRIES}).")
     return entries
+
+
+def _finish(wallet: WalletBalance, label: str | None) -> WalletBalance:
+    wallet.label = label
+    sanitize_wallet(wallet)  # printable text, no secrets, sane numbers
+    return wallet
 
 
 def resolve_wallet(label: str | None, forced_chain: str | None, address: str) -> WalletBalance:
@@ -48,22 +66,38 @@ def resolve_wallet(label: str | None, forced_chain: str | None, address: str) ->
         provider_cls = get_provider_by_name(forced_chain)
         if provider_cls is None:
             known = ", ".join(p.chain_id for p in PROVIDERS)
-            return WalletBalance(
-                chain=forced_chain,
-                address=address,
-                native_symbol="?",
-                error=f"Unknown chain '{forced_chain}'. Known chains: {known}",
-                label=label,
+            return _finish(
+                WalletBalance(
+                    chain=forced_chain,
+                    address=address,
+                    native_symbol="?",
+                    error=f"Unknown chain '{clean_text(forced_chain, 30)}'. Known chains: {known}",
+                ),
+                label,
+            )
+        # A forced chain must still look like an address of that chain: the
+        # value is placed in URLs and RPC payloads.
+        if not provider_cls.matches(address):
+            return _finish(
+                WalletBalance(
+                    chain=provider_cls.chain_id,
+                    address=address,
+                    native_symbol=provider_cls.native_symbol,
+                    error=f"Invalid {provider_cls.display_name} address format.",
+                ),
+                label,
             )
     else:
         provider_cls = detect_provider(address)
         if provider_cls is None:
-            return WalletBalance(
-                chain="unknown",
-                address=address,
-                native_symbol="?",
-                error="Could not auto-detect chain from address format.",
-                label=label,
+            return _finish(
+                WalletBalance(
+                    chain="unknown",
+                    address=address,
+                    native_symbol="?",
+                    error="Could not auto-detect chain from address format.",
+                ),
+                label,
             )
 
     provider = provider_cls()
@@ -74,10 +108,9 @@ def resolve_wallet(label: str | None, forced_chain: str | None, address: str) ->
             chain=provider_cls.chain_id,
             address=address,
             native_symbol=provider_cls.native_symbol,
-            error=f"Unexpected error: {exc}",
+            error=f"Unexpected error: {safe_error(exc)}",
         )
-    wallet.label = label
-    return wallet
+    return _finish(wallet, label)
 
 
 def fetch_all(
@@ -86,6 +119,7 @@ def fetch_all(
     on_progress: Callable[[int, int], None] | None = None,
 ) -> list[WalletBalance]:
     results: list[WalletBalance] = [None] * len(entries)  # type: ignore
+    workers = max(1, min(int(workers), MAX_WORKERS))
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as pool:
         future_to_idx = {
@@ -229,6 +263,7 @@ def build_json(results: list[WalletBalance]) -> str:
 
 
 def build_csv(results: list[WalletBalance]) -> str:
+    t = csv_text  # neutralise =,+,-,@ spreadsheet formula injection
     out = io.StringIO()
     writer = csv.writer(out)
     writer.writerow(
@@ -238,35 +273,36 @@ def build_csv(results: list[WalletBalance]) -> str:
         ]
     )
     for wallet in results:
-        label = wallet.label or ""
+        label = t(wallet.label or "")
+        chain, addr = t(wallet.chain), t(wallet.address)
         if wallet.error:
             writer.writerow(
-                [label, wallet.chain, wallet.address, "native", wallet.native_symbol, "", "", "", "", "", wallet.error, ""]
+                [label, chain, addr, "native", t(wallet.native_symbol), "", "", "", "", "", t(wallet.error), ""]
             )
             continue
         if not wallet.native_hidden:
             writer.writerow(
                 [
-                    label, wallet.chain, wallet.address, "native", wallet.native_symbol, "",
+                    label, chain, addr, "native", t(wallet.native_symbol), "",
                     wallet.native_amount, wallet.native_usd_value, wallet.native_eur_value,
-                    "", "", wallet.warning or "",
+                    "", "", t(wallet.warning or ""),
                 ]
             )
         for tok in wallet.tokens:
             writer.writerow(
                 [
-                    label, wallet.chain, wallet.address, tok.asset_type, tok.symbol, tok.name,
-                    tok.amount, tok.usd_value, tok.eur_value, tok.contract or "", "", "",
+                    label, chain, addr, t(tok.asset_type), t(tok.symbol), t(tok.name),
+                    tok.amount, tok.usd_value, tok.eur_value, t(tok.contract or ""), "", "",
                 ]
             )
         writer.writerow(
-            [label, wallet.chain, wallet.address, "TOTAL", "", "", "", wallet.total_usd, wallet.total_eur, "", "", ""]
+            [label, chain, addr, "TOTAL", "", "", "", wallet.total_usd, wallet.total_eur, "", "", ""]
         )
 
     label_totals = compute_label_totals(results)
     if label_totals:
         writer.writerow([])
         writer.writerow(["label", "", "", "LABEL_TOTAL", "", "", "", "usd_value", "eur_value", "", "", ""])
-        for label, t in label_totals.items():
-            writer.writerow([label, "", "", "LABEL_TOTAL", "", "", "", t["usd"], t["eur"], "", "", ""])
+        for label, tot in label_totals.items():
+            writer.writerow([t(label), "", "", "LABEL_TOTAL", "", "", "", tot["usd"], tot["eur"], "", "", ""])
     return out.getvalue()

@@ -4,6 +4,15 @@ on:
   push:
   workflow_dispatch:
 
+# Least privilege: the workflow only needs to read the repository.
+permissions:
+  contents: read
+
+# A newer push supersedes a running build of the same ref.
+concurrency:
+  group: build-apk-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     name: build (${{ matrix.name }})
@@ -21,6 +30,8 @@ jobs:
             archs: "arm64-v8a"
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false   # the build never needs to push
 
       - uses: actions/setup-python@v5
         with:
@@ -41,7 +52,7 @@ jobs:
       - name: Install Buildozer
         run: |
           python -m pip install --upgrade pip
-          pip install --upgrade buildozer Cython==0.29.33 virtualenv
+          pip install buildozer==1.6.0 Cython==0.29.33 virtualenv
 
       # python-for-android's current "master" builds Python 3.14 and its build
       # venv ends up with a broken pip (ImportError in `pip install -U pip`).
@@ -90,9 +101,11 @@ jobs:
         with:
           name: build-log-${{ matrix.name }}
           path: build.log
+          retention-days: 7
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: wallet-checker-apk-${{ matrix.name }}
           path: bin/*.apk
+          retention-days: 30

@@ -28,10 +28,29 @@ from __future__ import annotations
 import requests
 
 from providers.base import TokenBalance, WalletBalance
+from providers.net import request_json
+from providers.safe import MAX_POSITION_USD, safe_price
 
 COINGECKO_API = "https://api.coingecko.com/api/v3"
 MULTIVERSX_API = "https://api.multiversx.com"
 FX_API = "https://api.frankfurter.app"  # free, no key, ECB-sourced FX rates
+
+#: hard stop for paginated endpoints (hostile/buggy API repeating full pages).
+MAX_PAGES = 20
+#: a USD->EUR rate outside this range is an API glitch, not a real FX rate.
+FX_MIN, FX_MAX = 0.05, 20.0
+
+
+def _clean_price_map(vals) -> dict[str, float]:
+    """{"usd": x, "eur": y} keeping only finite, positive, sane prices."""
+    out: dict[str, float] = {}
+    if isinstance(vals, dict):
+        for cur in ("usd", "eur"):
+            p = safe_price(vals.get(cur))
+            if p is not None:
+                out[cur] = p
+    return out
+
 
 # chain_id (as used by our providers) -> CoinGecko coin id, for the native coin.
 NATIVE_COINGECKO_IDS: dict[str, str] = {
@@ -80,20 +99,20 @@ def _fetch_native_prices(chain_ids: set[str]) -> dict[str, dict[str, float]]:
     if not gecko_ids:
         return {}
     try:
-        resp = requests.get(
+        data = request_json(
+            "GET",
             f"{COINGECKO_API}/simple/price",
-            params={"ids": ",".join(gecko_ids), "vs_currencies": "usd,eur"},
-            timeout=20,
+            params={"ids": ",".join(sorted(gecko_ids)), "vs_currencies": "usd,eur"},
         )
-        resp.raise_for_status()
-        data = resp.json()
-    except (requests.RequestException, ValueError):
+        if not isinstance(data, dict):
+            return {}
+    except requests.RequestException:
         return {}
 
     result: dict[str, dict[str, float]] = {}
     for chain_id, gecko_id in NATIVE_COINGECKO_IDS.items():
         if gecko_id in data:
-            result[chain_id] = data[gecko_id]
+            result[chain_id] = _clean_price_map(data[gecko_id])
     return result
 
 
@@ -111,20 +130,25 @@ def _fetch_token_prices(
     for i in range(0, len(contracts_list), chunk_size):
         chunk = contracts_list[i : i + chunk_size]
         try:
-            resp = requests.get(
+            data = request_json(
+                "GET",
                 f"{COINGECKO_API}/simple/token_price/{platform}",
                 params={
                     "contract_addresses": ",".join(chunk),
                     "vs_currencies": "usd,eur",
                 },
-                timeout=20,
             )
-            resp.raise_for_status()
-            data = resp.json()
-        except (requests.RequestException, ValueError):
+            if not isinstance(data, dict):
+                continue
+        except requests.RequestException:
             continue
         for addr, vals in data.items():
-            prices[addr.lower()] = vals
+            if isinstance(addr, str):
+                clean = _clean_price_map(vals)
+                # Solana mints are case-sensitive base58: keep the exact key
+                # too, in addition to the lowercase one used for EVM.
+                prices[addr] = clean
+                prices[addr.lower()] = clean
     return prices
 
 
@@ -132,11 +156,11 @@ def _fetch_usd_eur_rate() -> float | None:
     """USD -> EUR conversion rate, used to convert xExchange's USD-only
     token prices into EUR (MultiversX's /mex-tokens only gives USD)."""
     try:
-        resp = requests.get(f"{FX_API}/latest", params={"from": "USD", "to": "EUR"}, timeout=15)
-        resp.raise_for_status()
-        return resp.json()["rates"]["EUR"]
-    except (requests.RequestException, ValueError, KeyError):
+        data = request_json("GET", f"{FX_API}/latest", params={"from": "USD", "to": "EUR"})
+        rate = safe_price(data["rates"]["EUR"])
+    except (requests.RequestException, KeyError, TypeError):
         return None
+    return rate if rate is not None and FX_MIN <= rate <= FX_MAX else None
 
 
 def _fetch_mex_tokens_prices() -> dict[str, float]:
@@ -144,32 +168,27 @@ def _fetch_mex_tokens_prices() -> dict[str, float]:
     set (those with a direct MEX/WEGLD pair), via MultiversX's /mex-tokens.
     Broad and cheap, but doesn't cover every token traded on xExchange."""
     prices: dict[str, float] = {}
-    offset = 0
     page_size = 100
-    while True:
+    for page in range(MAX_PAGES):
         try:
-            resp = requests.get(
+            batch = request_json(
+                "GET",
                 f"{MULTIVERSX_API}/mex-tokens",
-                params={"from": offset, "size": page_size},
-                timeout=20,
+                params={"from": page * page_size, "size": page_size},
             )
-            resp.raise_for_status()
-            batch = resp.json()
-        except (requests.RequestException, ValueError):
+        except requests.RequestException:
             break
-        if not batch:
+        if not isinstance(batch, list) or not batch:
             break
         for tok in batch:
+            if not isinstance(tok, dict):
+                continue
             identifier = tok.get("id") or tok.get("identifier")
-            price = tok.get("price")
-            if identifier and price is not None:
-                try:
-                    prices[identifier] = float(price)
-                except (TypeError, ValueError):
-                    pass
+            price = safe_price(tok.get("price"))
+            if isinstance(identifier, str) and price is not None:
+                prices[identifier] = price
         if len(batch) < page_size:
             break
-        offset += page_size
     return prices
 
 
@@ -185,23 +204,22 @@ def _fetch_token_prices_by_identifier(identifiers: set[str]) -> dict[str, float]
     for i in range(0, len(ids_list), chunk_size):
         chunk = ids_list[i : i + chunk_size]
         try:
-            resp = requests.get(
+            batch = request_json(
+                "GET",
                 f"{MULTIVERSX_API}/tokens",
                 params={"identifiers": ",".join(chunk), "size": len(chunk)},
-                timeout=20,
             )
-            resp.raise_for_status()
-            batch = resp.json()
-        except (requests.RequestException, ValueError):
+            if not isinstance(batch, list):
+                continue
+        except requests.RequestException:
             continue
         for tok in batch:
+            if not isinstance(tok, dict):
+                continue
             identifier = tok.get("identifier")
-            price = tok.get("price")
-            if identifier and price is not None:
-                try:
-                    prices[identifier] = float(price)
-                except (TypeError, ValueError):
-                    pass
+            price = safe_price(tok.get("price"))
+            if isinstance(identifier, str) and price is not None:
+                prices[identifier] = price
     return prices
 
 
@@ -222,22 +240,29 @@ def _price_token(
         usd = xexchange_prices.get(tok.contract)
         eur = usd * usd_eur_rate if usd is not None and usd_eur_rate is not None else None
     elif tok.asset_type in CONTRACT_PRICED_TYPES and tok.contract:
-        tp = token_prices.get(tok.contract.lower())
+        tp = token_prices.get(tok.contract) or token_prices.get(tok.contract.lower())
         usd = tp.get("usd") if tp else None
         eur = tp.get("eur") if tp else None
     else:
         # NFTs/SFTs etc.: no reliable floor-price source here.
         return
 
-    if usd is not None:
+    # A single position worth more than MAX_POSITION_USD is a pricing glitch
+    # or a manipulated illiquid pool, not real money: leave it unpriced
+    # instead of poisoning every total.
+    if usd is not None and tok.amount * usd <= MAX_POSITION_USD:
         tok.usd_value = tok.amount * usd
-    if eur is not None:
-        tok.eur_value = tok.amount * eur
+        if eur is not None and tok.amount * eur <= MAX_POSITION_USD * FX_MAX:
+            tok.eur_value = tok.amount * eur
 
 
-def apply_pricing(results: list[WalletBalance]) -> None:
+def apply_pricing(results: list[WalletBalance]) -> bool:
     """Mutate `results` in place, filling in usd_value/eur_value on every
-    native balance and token/staking entry, plus each wallet's totals."""
+    native balance and token/staking entry, plus each wallet's totals.
+
+    Returns False when no native price could be fetched at all (CoinGecko
+    down / rate-limited): callers must then NOT hide "unpriced" lines, they
+    are simply not priced yet."""
     chain_ids = {w.chain for w in results if not w.error}
     native_prices = _fetch_native_prices(chain_ids)
 
@@ -250,7 +275,7 @@ def apply_pricing(results: list[WalletBalance]) -> None:
                     multiversx_identifiers.add(tok.contract)
                 else:
                     contracts_by_chain.setdefault(w.chain, set()).add(
-                        tok.contract.lower()
+                        tok.contract.lower() if w.chain == "ethereum" else tok.contract
                     )
 
     token_prices_by_chain = {
@@ -282,11 +307,11 @@ def apply_pricing(results: list[WalletBalance]) -> None:
         if w.native_amount is not None:
             usd = native_price.get("usd")
             eur = native_price.get("eur")
-            if usd is not None:
+            if usd is not None and w.native_amount * usd <= MAX_POSITION_USD:
                 w.native_usd_value = w.native_amount * usd
                 total_usd += w.native_usd_value
                 has_any_price = True
-            if eur is not None:
+            if eur is not None and w.native_usd_value is not None:
                 w.native_eur_value = w.native_amount * eur
                 total_eur += w.native_eur_value
 
@@ -304,3 +329,5 @@ def apply_pricing(results: list[WalletBalance]) -> None:
         if has_any_price:
             w.total_usd = total_usd
             w.total_eur = total_eur
+
+    return not chain_ids or bool(native_prices)

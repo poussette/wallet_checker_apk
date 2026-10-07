@@ -18,7 +18,6 @@ import os
 import json
 import time
 import threading
-import traceback
 
 # Android has no reliable default CA bundle path for `requests`/urllib3 to
 # find on its own; point it at certifi's bundled one explicitly, before any
@@ -47,11 +46,12 @@ from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
 from kivy.uix.textinput import TextInput
 from kivy.uix.widget import Widget
-from kivy.utils import escape_markup
+from kivy.utils import escape_markup, platform
 
 import report
+from providers.safe import clean_text, safe_error
 
-APP_VERSION = "0.4"
+APP_VERSION = "0.5"
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
 # Monospace font shipped with Kivy (used for the config editor).
@@ -81,7 +81,35 @@ DEFAULT_SETTINGS = {
     "beacon_key": "",
     "show_unpriced": False,
     "show_dust": False,
+    "secure_screen": False,
 }
+
+#: limits on what a (possibly corrupted/tampered) settings file or a huge
+#: paste may feed into the app.
+MAX_CONFIG_CHARS = 200_000
+MAX_KEY_CHARS = 300
+MAX_ROWS_PER_WALLET = 200
+
+
+def sanitize_settings(raw) -> dict:
+    """Return a settings dict with the right types/limits, whatever `raw` is."""
+    out = dict(DEFAULT_SETTINGS)
+    if not isinstance(raw, dict):
+        return out
+    cfg = raw.get("config_text")
+    if isinstance(cfg, str):
+        out["config_text"] = cfg[:MAX_CONFIG_CHARS]
+    for k in ("etherscan_key", "beacon_key"):
+        v = raw.get(k)
+        if isinstance(v, str):
+            # API keys are printable ASCII without spaces; anything else
+            # (newline, control chars...) would be a header/URL injection.
+            v = "".join(ch for ch in v.strip() if 33 <= ord(ch) < 127)
+            out[k] = v[:MAX_KEY_CHARS]
+    for k in ("show_unpriced", "show_dust", "secure_screen"):
+        if isinstance(raw.get(k), bool):
+            out[k] = raw[k]
+    return out
 
 
 # ---------------------------------------------------------------------- theme
@@ -458,6 +486,7 @@ class WalletCheckerApp(App):
         self.last_text = ""
         self.settings_path = os.path.join(self.user_data_dir, SETTINGS_FILENAME)
         self.settings = self.load_settings()
+        self._apply_secure_screen(self.settings.get("secure_screen", False))
 
         root = BoxLayout(orientation="vertical")
 
@@ -524,21 +553,54 @@ class WalletCheckerApp(App):
     # ---------------------------------------------------------------- settings
 
     def load_settings(self) -> dict:
-        data = dict(DEFAULT_SETTINGS)
         try:
             with open(self.settings_path, "r", encoding="utf-8") as f:
-                data.update(json.load(f))
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
-            pass
-        return data
+                return sanitize_settings(json.load(f))
+        except (FileNotFoundError, ValueError, OSError, RecursionError):
+            return dict(DEFAULT_SETTINGS)
 
     def save_settings(self, data: dict) -> None:
-        self.settings = data
+        """Validate, then write atomically (temp file + rename) with owner-only
+        permissions: the file holds the wallet list and API keys. It lives in
+        the app-private directory (other apps cannot read it) and backups are
+        disabled in buildozer.spec."""
+        self.settings = sanitize_settings(data)
+        tmp = self.settings_path + ".tmp"
         try:
             os.makedirs(self.user_data_dir, exist_ok=True)
-            with open(self.settings_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(self.settings, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp, self.settings_path)
         except OSError:
+            self.status_label.text = "Impossible d'enregistrer la configuration."
+
+    def _apply_secure_screen(self, on: bool) -> None:
+        """Optional FLAG_SECURE: hides the app from screenshots, screen
+        recording and the recent-apps thumbnail (balances are sensitive)."""
+        if platform != "android":
+            return
+        try:
+            from android.runnable import run_on_ui_thread
+            from jnius import autoclass
+
+            params = autoclass("android.view.WindowManager$LayoutParams")
+            activity = autoclass("org.kivy.android.PythonActivity").mActivity
+
+            @run_on_ui_thread
+            def _apply():
+                window = activity.getWindow()
+                if on:
+                    window.addFlags(params.FLAG_SECURE)
+                else:
+                    window.clearFlags(params.FLAG_SECURE)
+
+            _apply()
+        except Exception:
             pass
 
     def _popup(self, title, content, **kwargs):
@@ -592,6 +654,14 @@ class WalletCheckerApp(App):
         ))
         content.add_widget(dust_row)
 
+        secure_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
+        secure_checkbox = CheckBox(active=self.settings.get("secure_screen", False), size_hint=(None, 1), width=dp(44))
+        secure_row.add_widget(secure_checkbox)
+        secure_row.add_widget(WrapLabel(
+            text="Masquer l'app des captures d'écran et des applis récentes", size_hint=(1, 1), font_size=sp(12),
+        ))
+        content.add_widget(secure_row)
+
         buttons_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
         cancel_btn = RoundedButton(text="Annuler", bg=SURFACE2, font_size=sp(15))
         save_btn = RoundedButton(text="Enregistrer", bg=ACCENT, fg=BG, font_size=sp(15))
@@ -608,7 +678,9 @@ class WalletCheckerApp(App):
                 "beacon_key": beacon_input.text.strip(),
                 "show_unpriced": unpriced_checkbox.active,
                 "show_dust": dust_checkbox.active,
+                "secure_screen": secure_checkbox.active,
             })
+            self._apply_secure_screen(self.settings["secure_screen"])
             popup.dismiss()
             self.status_label.text = "Configuration enregistrée. Appuie sur Actualiser."
 
@@ -642,7 +714,11 @@ class WalletCheckerApp(App):
     def on_run(self, _instance):
         if self.running:
             return
-        entries = report.parse_input_text(self.settings.get("config_text", ""))
+        try:
+            entries = report.parse_input_text(self.settings.get("config_text", ""))
+        except ValueError as exc:
+            self.status_label.text = safe_error(exc)
+            return
         if not entries:
             self.status_label.text = "Aucune adresse dans la configuration -- ouvre Paramètres pour en coller."
             return
@@ -670,7 +746,7 @@ class WalletCheckerApp(App):
             priced_ok = True
             try:
                 from pricing import apply_pricing
-                apply_pricing(results)
+                priced_ok = apply_pricing(results) is not False
             except Exception:
                 priced_ok = False  # offline / pricing down: keep raw balances
 
@@ -681,8 +757,9 @@ class WalletCheckerApp(App):
 
             text = report.format_table(results)
             Clock.schedule_once(lambda dt: self._finish(results, text, None, priced_ok))
-        except Exception:
-            err = traceback.format_exc()
+        except Exception as exc:
+            # Never show a raw traceback: it can embed URLs with API keys.
+            err = safe_error(exc) or exc.__class__.__name__
             Clock.schedule_once(lambda dt: self._finish(None, None, err, True))
 
     def _finish(self, results, text, error, priced_ok):
@@ -691,18 +768,18 @@ class WalletCheckerApp(App):
         self.run_btn.text = "Actualiser"
         self.results_box.clear_widgets()
         if error:
-            self.status_label.text = "Erreur inattendue (détail ci-dessous)."
+            self.status_label.text = "Erreur inattendue."
             self.results_box.add_widget(WrapLabel(
-                text=f"[color={RED_HEX}]{esc(error)}[/color]", markup=True, font_size=sp(11),
+                text=f"[color={RED_HEX}]{esc(clean_text(error, 300))}[/color]", markup=True, font_size=sp(11),
             ))
             return
         self.last_results = results
         self.last_text = text
         try:
             self.render_results(results)
-        except Exception:
+        except Exception as exc:
             self.results_box.add_widget(WrapLabel(
-                text=f"[color={RED_HEX}]{esc(traceback.format_exc())}[/color]", markup=True, font_size=sp(11),
+                text=f"[color={RED_HEX}]{esc(safe_error(exc))}[/color]", markup=True, font_size=sp(11),
             ))
         msg = f"Mis à jour à {time.strftime('%H:%M')} · {len(results)} wallet(s)"
         if not priced_ok:
@@ -852,12 +929,19 @@ class WalletCheckerApp(App):
                 w.native_symbol, "coin", None, w.native_amount, w.native_usd_value, w.native_eur_value,
             ))
             shown += 1
-        for t in sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0)):
+        ordered = sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0))
+        extra = max(0, len(ordered) - MAX_ROWS_PER_WALLET)
+        for t in ordered[:MAX_ROWS_PER_WALLET]:
             tag = t.asset_type if t.asset_type != "token" else None
             name = t.name if t.name and t.name != t.symbol else None
             body.add_widget(self._row(t.symbol, tag, name, t.amount, t.usd_value, t.eur_value))
             shown += 1
 
+        if extra:
+            body.add_widget(WrapLabel(
+                text=f"[color={FAINT_HEX}]+ {extra} autre(s) position(s) non affichée(s) (liste trop longue)[/color]",
+                markup=True, font_size=sp(11),
+            ))
         hidden = w.hidden_unpriced_count + w.hidden_dust_count
         if hidden:
             body.add_widget(WrapLabel(
