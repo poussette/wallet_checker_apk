@@ -4,7 +4,7 @@ package.name = walletchecker
 package.domain = org.walletchecker
 source.dir = .
 source.include_exts = py
-version = 0.2
+version = 0.4
 requirements = python3,kivy,requests,certifi,urllib3,idna,charset_normalizer
 orientation = portrait
 fullscreen = 0
@@ -12,6 +12,9 @@ fullscreen = 0
 android.permissions = INTERNET
 android.api = 33
 android.minapi = 21
+# Both ABIs on purpose: arm64-v8a for modern phones, armeabi-v7a for older
+# and some low-end devices that still run a 32-bit system. Maximum
+# compatibility, at the cost of a bigger APK.
 android.archs = arm64-v8a,armeabi-v7a
 android.accept_sdk_license = True
 # Avoids a slow/flaky first-time NDK download picking an unexpected version.
