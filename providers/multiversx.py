@@ -35,6 +35,9 @@ delegation contract, not the wallet, so it's covered too:
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 import re
 from urllib.parse import quote
 

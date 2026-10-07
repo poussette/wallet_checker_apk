@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 

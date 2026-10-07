@@ -15,6 +15,9 @@ TLS certificate verification is never disabled.
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 import json
 import threading
 import time
@@ -82,7 +85,11 @@ MAX_RETRY_AFTER = 10.0
 #: shared by all worker threads: stays under the free-tier rate limits
 #: (api.multiversx.com answers 429 when 24 wallets fire ~7 calls each at once).
 THROTTLE_ENABLED = True
-MIN_INTERVAL = {"api.multiversx.com": 0.4, "api.coingecko.com": 1.5}
+MIN_INTERVAL = {
+    "api.multiversx.com": 0.4,
+    "gateway.multiversx.com": 0.15,
+    "api.coingecko.com": 1.5,
+}
 DEFAULT_INTERVAL = 0.05
 _throttle_lock = threading.Lock()
 _next_slot: dict[str, float] = {}

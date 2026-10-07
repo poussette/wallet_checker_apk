@@ -29,6 +29,9 @@ ADAPTERS below. See README, section "LP tokens".
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 import base64
 import binascii
 import json
@@ -125,12 +128,27 @@ ADAPTERS: list[dict] = [
         "reserves": ["getBalances", "getReserves", "getPoolReserves", "getTokenReserves"],
         "supply": ["getTotalSupply", "getLpTotalSupply", "getLpSupply", "getTotalLpSupply"],
     },
+    {   # JEX stable pools (3USD, USDC/USDT...), Curve-like.
+        "name": "jex-stable", "kind": "stable", "curve": "multi",
+        "code_hashes": ["1rVgfuWwjKwNuBM7c56RaeXS3raiTunJ2xQBQKYwug4=",   # USDC/USDT
+                        "KV//LSzx57BCMaH9s7UGQomf5OazdF9yffd+/c90HKo="],  # 3USD
+        "lp": ["getLptoken", "getLpToken", "getLpTokenIdentifier"],
+        "tokens": ["getTokens"],
+        "status": ["getStatus"],
+        "supply": ["getLpTokenSupply", "getTotalSupply"],
+        "virtual_price": ["getVirtualPrice"],
+    },
 ]
 
 # "code_hashes": contract code hashes observed on the real pools of that DEX. A
 # self-consistent pool with another code is still valued, but flagged "contrat
 # non vérifié" and never with the 50/50 doubling: anyone can deploy a contract
 # that answers these views with invented numbers (see README, "Limites").
+
+# (JEX stable pools, "kind": "stable": no list/reserve views, only getStatus (a
+#  blob that contains the token ids) and getVirtualPrice. Reserves = the
+#  contract's live balances of those tokens, cross-checked against the virtual
+#  price, which is the pool's own LP-value-in-peg-units figure.)
 
 #: view names tried by lp_probe.py to help writing a new adapter.
 PROBE_NAMES = [
@@ -325,6 +343,7 @@ def candidate_contracts(lp: str, facts: dict) -> list[str]:
             and addr not in out
         ):
             out.append(addr)
+    facts["role_holders"] = set(out)
     if facts["owner"] and facts["owner"] not in out:
         out.append(facts["owner"])
     return out[:MAX_CANDIDATES]
@@ -351,12 +370,14 @@ def _balance(sc: str, token: str) -> int:
 
 class PoolState:
     def __init__(self, adapter: str, reserves: dict[str, int], curve: str,
-                 verified: bool = False, from_balances: bool = False):
+                 verified: bool = False, from_balances: bool = False,
+                 virtual_price: int | None = None):
         self.adapter = adapter
         self.reserves = reserves
         self.curve = curve  # "constant_product" (2 tokens) or "multi"
         self.verified = verified          # contract code hash is a known one
         self.from_balances = from_balances  # reserves = contract balances, not a view
+        self.virtual_price = virtual_price  # stable pools: LP value in peg units, 1e18 scale
 
 
 class Inconsistent(Exception):
@@ -382,7 +403,7 @@ def _code_hash(sc: str, budget: Budget) -> str | None:
 
 
 def _verify(spec, sc, facts, reserves: dict[str, int], supply: int, budget: Budget,
-            from_balances: bool = False) -> PoolState:
+            from_balances: bool = False, virtual_price: int | None = None) -> PoolState:
     if len(reserves) < 2 or any(v <= 0 for v in reserves.values()):
         raise Inconsistent("unreadable reserves")
     if not _supply_ok(supply, facts["supply_raw"]):
@@ -393,7 +414,7 @@ def _verify(spec, sc, facts, reserves: dict[str, int], supply: int, budget: Budg
         if not _within(res, _balance(sc, tok)):
             raise Inconsistent("reserve exceeds the contract's balance")
     verified = _code_hash(sc, budget) in spec.get("code_hashes", ())
-    return PoolState(spec["name"], dict(reserves), spec["curve"], verified, from_balances)
+    return PoolState(spec["name"], dict(reserves), spec["curve"], verified, from_balances, virtual_price)
 
 
 def _names_lp(spec, sc, lp, budget, args) -> bool | None:
@@ -601,10 +622,48 @@ def _try_lists(spec, lp, facts, sc, ctx, budget):
             if not budget.spend():
                 raise requests.RequestException("LP query budget exhausted")
             vals.append(_balance(sc, t))
-    return _verify(spec, sc, facts, dict(zip(ids, vals)), sup, budget, from_balances)
+    vp = _virtual_price(sc, ["getVirtualPrice"], budget)
+    return _verify(spec, sc, facts, dict(zip(ids, vals)), sup, budget, from_balances, vp)
 
 
-_STRATEGY = {"pair3": _try_pair3, "named": _try_named, "keyed": _try_keyed, "lists": _try_lists}
+def _virtual_price(sc, names, budget) -> int | None:
+    _, ans = _first_answer(sc, names, [], budget)
+    vp = as_uint(ans[0]) if ans else None
+    return vp if vp and 0 < vp < 10**30 else None
+
+
+def _scan_token_ids(blob: bytes) -> list[str]:
+    """Token ids found in an opaque answer, in order of appearance."""
+    found = re.findall(rb"[A-Z0-9]{3,10}-[0-9a-f]{6}", blob)
+    return list(dict.fromkeys(x.decode("ascii") for x in found))[:8]
+
+
+def _try_stable(spec, lp, facts, sc, ctx, budget):
+    vp = _virtual_price(sc, spec["virtual_price"], budget)
+    if vp is None:
+        return None  # not a stable pool
+    named = _names_lp(spec, sc, lp, budget, [])  # optional here: raises if another LP
+    if not named and sc not in facts.get("role_holders", ()):
+        return None  # nothing ties this contract to this LP token
+    _, tk = _first_answer(sc, spec["tokens"], [], budget)
+    ids = _token_list(tk or [])
+    if not ids:
+        _, st = _first_answer(sc, spec["status"], [], budget)
+        # the status blob also carries the LP token's own id, which the pool does not hold
+        ids = [t for t in _scan_token_ids(b"".join(st or [])) if t != lp]
+    if len(ids) < 2:
+        return None
+    _, sp = _first_answer(sc, spec["supply"], [], budget)
+    sup = as_uint(sp[0]) if sp else facts["supply_raw"]
+    vals = []
+    for t in ids:
+        if not budget.spend():
+            raise requests.RequestException("LP query budget exhausted")
+        vals.append(_balance(sc, t))
+    return _verify(spec, sc, facts, dict(zip(ids, vals)), sup, budget, True, vp)
+
+
+_STRATEGY = {"pair3": _try_pair3, "named": _try_named, "keyed": _try_keyed, "lists": _try_lists, "stable": _try_stable}
 
 
 def _ctx(cache: dict, sc: str, budget: Budget) -> dict:
@@ -702,6 +761,18 @@ def looks_like_lp(symbol: str, name: str) -> bool:
     return any(w in text for w in _LP_WORDS)
 
 
+def _vp_mismatch(st: PoolState, infos: dict, price: float) -> bool:
+    """Stable pools publish a virtual price (LP value in units of the pegged
+    asset). The balances-based price must agree with it, within a loose band."""
+    if not st.virtual_price:
+        return False
+    prices = [(infos.get(t) or {}).get("price") for t in st.reserves]
+    if not prices or not all(prices):
+        return True
+    expected = st.virtual_price / 1e18 * (sum(prices) / len(prices))
+    return not (expected > 0 and 0.88 <= price / expected <= 1.12)
+
+
 def _global_exhausted(budget: Budget) -> bool:
     return budget.calls <= 0 or time.monotonic() > budget.deadline
 
@@ -780,7 +851,7 @@ def price_lp_tokens(candidates: list[str], fetch_infos, on_progress=None) -> dic
             price = value / supply if supply > 0 else None
         except (OverflowError, ZeroDivisionError):
             continue
-        if price and math.isfinite(price) and price > 0:
+        if price and math.isfinite(price) and price > 0 and not _vp_mismatch(st, infos, price):
             label = st.adapter
             if estimated:
                 label += ", estimation 50/50"

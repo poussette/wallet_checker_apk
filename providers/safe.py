@@ -12,6 +12,9 @@ UI markup, or (d) poison totals with NaN/inf/absurd numbers.
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 import math
 import os
 import re
@@ -73,6 +76,7 @@ _SENSITIVE_ENV = (
     "BEACONCHAIN_API_KEY",
     "ETH_RPC_URL",
     "SOLANA_RPC_URL",
+    "MULTIVERSX_GATEWAY_URL",
 )
 _QUERY_SECRET_RE = re.compile(
     r"(?i)((?:api[-_]?key|apikey|access[-_]?token|token|secret|auth|key)=)[^&\s\"'<>)]+"

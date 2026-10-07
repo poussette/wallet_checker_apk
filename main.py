@@ -14,6 +14,9 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
+__version__ = "0.8.4"
+
+
 import os
 import json
 import time
@@ -51,7 +54,21 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.8"
+APP_VERSION = "0.8.4"
+
+
+def _version_problems() -> list[str]:
+    """Component files whose release differs from the app's (a patch copied over
+    an older tree leaves such files behind). Never raises."""
+    try:
+        from providers import version as _v
+        return _v.mismatches({"main": __version__}) if _v.VERSION == APP_VERSION else \
+            [f"providers/version.py ({_v.VERSION})"] + _v.mismatches({"main": __version__})
+    except Exception:  # noqa: BLE001
+        return ["providers/version.py (?)"]
+
+
+VERSION_PROBLEMS = _version_problems()
 SETTINGS_FILENAME = "wallet_checker_settings.json"
 
 # Monospace font shipped with Kivy (used for the config editor).
@@ -500,7 +517,7 @@ class WalletCheckerApp(App):
             padding=(dp(20), dp(12), dp(16), dp(4)),
         )
         top_bar.add_widget(mk_label(
-            f"Wallet Checker  [size={int(sp(11))}][color={MUTED_HEX}]v{APP_VERSION}[/color][/size]",
+            f"Wallet Checker  [size={int(sp(11))}][color={MUTED_HEX}]v{APP_VERSION}{' (!)' if VERSION_PROBLEMS else ''}[/color][/size]",
             size=17, bold=True, markup=True,
         ))
         settings_btn = IconButton(size_hint=(None, None), size=(dp(44), dp(44)), bg=SURFACE)
@@ -825,6 +842,8 @@ class WalletCheckerApp(App):
             msg += " · prix indisponibles, soldes bruts affichés"
         for note in notes:
             msg += " · " + note
+        if VERSION_PROBLEMS:
+            msg += " · (!) fichiers d'une autre version : " + clean_text(", ".join(VERSION_PROBLEMS), 150)
         self.status_label.text = msg
         self.export_btn.disabled = False
         self.scroll.scroll_y = 1
