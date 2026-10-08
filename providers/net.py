@@ -15,7 +15,8 @@ TLS certificate verification is never disabled.
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
+
 
 
 

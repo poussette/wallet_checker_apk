@@ -14,7 +14,8 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.0"
+__version__ = "0.9.1"
+
 
 
 
@@ -57,7 +58,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.0"
+APP_VERSION = "0.9.1"
 
 
 def _version_problems() -> list[str]:
@@ -111,7 +112,9 @@ DEFAULT_SETTINGS = {
 #: paste may feed into the app.
 MAX_CONFIG_CHARS = 200_000
 MAX_KEY_CHARS = 300
-MAX_ROWS_PER_WALLET = 200
+MAX_ROWS_PER_WALLET = 200        # first page; "Afficher plus" adds ROWS_PAGE at a time
+ROWS_PAGE = 150
+MAX_ROWS_HARD = 3000             # absolute ceiling per wallet (a hostile airdrop must not freeze the UI)
 
 
 def sanitize_settings(raw) -> dict:
@@ -1004,29 +1007,55 @@ class WalletCheckerApp(App):
                 w.native_symbol, "coin", None, w.native_amount, w.native_usd_value, w.native_eur_value,
             ))
             shown += 1
-        ordered = sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0))
-        extra = max(0, len(ordered) - MAX_ROWS_PER_WALLET)
-        for t in ordered[:MAX_ROWS_PER_WALLET]:
-            tag = t.asset_type if t.asset_type != "token" else None
-            name = t.name if t.name and t.name != t.symbol else None
-            body.add_widget(self._row(t.symbol, tag, name, t.amount, t.usd_value, t.eur_value))
-            shown += 1
+        ordered = sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0))[:MAX_ROWS_HARD]
+        total_tokens = len(w.tokens)
+        state = {"n": 0, "tail": []}
 
-        if extra:
-            body.add_widget(WrapLabel(
-                text=f"[color={FAINT_HEX}]+ {extra} autre(s) position(s) non affichée(s) (liste trop longue)[/color]",
-                markup=True, font_size=sp(11),
-            ))
-        hidden = w.hidden_unpriced_count + w.hidden_dust_count
-        if hidden:
-            body.add_widget(WrapLabel(
-                text=f"[color={FAINT_HEX}]{hidden} position(s) masquée(s) (sans valeur ou < 1 centime)[/color]",
-                markup=True, font_size=sp(11),
-            ))
-        elif not shown:
-            body.add_widget(WrapLabel(
-                text=f"[color={MUTED_HEX}]Aucune position.[/color]", markup=True, font_size=sp(12),
-            ))
+        def add_rows(count):
+            for t in ordered[state["n"]:state["n"] + count]:
+                tag = t.asset_type if t.asset_type != "token" else None
+                name = t.name if t.name and t.name != t.symbol else None
+                body.add_widget(self._row(t.symbol, tag, name, t.amount, t.usd_value, t.eur_value))
+            state["n"] = min(len(ordered), state["n"] + count)
+
+        def add_tail():
+            """Footer widgets (more button, hidden counts); rebuilt after each page."""
+            for wdg in state["tail"]:
+                body.remove_widget(wdg)
+            state["tail"] = []
+            left = len(ordered) - state["n"]
+            if left > 0:
+                btn = RoundedButton(
+                    text=f"Afficher {min(ROWS_PAGE, left)} de plus  ({left} restantes)",
+                    size_hint=(1, None), height=dp(44), bg=SURFACE2, font_size=sp(13),
+                )
+
+                def more(_b):
+                    add_rows(ROWS_PAGE)
+                    add_tail()
+                btn.bind(on_release=more)
+                state["tail"].append(btn)
+            if total_tokens > len(ordered) and left <= 0:
+                state["tail"].append(WrapLabel(
+                    text=f"[color={FAINT_HEX}]+ {total_tokens - len(ordered)} position(s) non affichée(s) (limite de sécurité)[/color]",
+                    markup=True, font_size=sp(11),
+                ))
+            hidden = w.hidden_unpriced_count + w.hidden_dust_count
+            if hidden:
+                state["tail"].append(WrapLabel(
+                    text=f"[color={FAINT_HEX}]{hidden} position(s) masquée(s) (sans valeur ou < 1 centime)[/color]",
+                    markup=True, font_size=sp(11),
+                ))
+            elif not shown and not ordered:
+                state["tail"].append(WrapLabel(
+                    text=f"[color={MUTED_HEX}]Aucune position.[/color]", markup=True, font_size=sp(12),
+                ))
+            for wdg in state["tail"]:
+                body.add_widget(wdg)
+
+        add_rows(MAX_ROWS_PER_WALLET)
+        shown += state["n"]
+        add_tail()
         return body
 
     @staticmethod
