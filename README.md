@@ -92,3 +92,10 @@ Chaque fichier porte son numéro (`__version__`) et `providers/version.py` fixe 
 - Un faux token airdroppé dans un pool très peu liquide peut afficher une valeur gonflée mais < 1 Md$ : méfie-toi des lignes de tokens inconnus.
 - L'APK est signé avec une clé *debug* générée à chaque build : Android considère chaque build comme un éditeur différent (désinstalle avant de réinstaller). Ne distribue pas ce fichier.
 - Ne commite jamais ta vraie liste : `addresses.txt`, `wallets*.txt` et les exports sont dans `.gitignore`. Vérifie avec `git ls-files`.
+
+## Affichage des wallets (v0.9.3)
+
+- Chaque label affiche, sous son total, le **nombre de positions par type** (esdt, nft, coin…).
+- En ouvrant un wallet, une **synthèse par type** (nombre + valorisation totale) apparaît en tête de liste.
+- Les positions **sans valeur connue ou < 1 centime** sont masquées par défaut ; le bouton en bas de liste (« N position(s) masquée(s) … Afficher ») les montre. À la réouverture du wallet elles sont de nouveau masquées. (Les anciennes options des Paramètres ont été supprimées.)
+- À l'ouverture d'un label, les wallets sont triés par valorisation totale décroissante.

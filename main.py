@@ -14,7 +14,7 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.2"
+__version__ = "0.9.3"
 
 
 
@@ -58,7 +58,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 
 
 def _version_problems() -> list[str]:
@@ -100,8 +100,6 @@ DEFAULT_SETTINGS = {
     "config_text": DEFAULT_CONFIG,
     "etherscan_key": "",
     "beacon_key": "",
-    "show_unpriced": False,
-    "show_dust": False,
     "secure_screen": False,
     "lp_pricing": True,
     "lp_trust_all": False,
@@ -135,7 +133,7 @@ def sanitize_settings(raw) -> dict:
     gw = raw.get("mvx_gateway")
     if isinstance(gw, str) and (not gw.strip() or validate_rpc_url(gw.strip())):
         out["mvx_gateway"] = gw.strip()[:MAX_KEY_CHARS]  # empty = public default
-    for k in ("show_unpriced", "show_dust", "secure_screen", "lp_pricing", "lp_trust_all"):
+    for k in ("secure_screen", "lp_pricing", "lp_trust_all"):
         if isinstance(raw.get(k), bool):
             out[k] = raw[k]
     return out
@@ -483,6 +481,7 @@ class Collapsible(Panel):
     def toggle(self, *_):
         if self._open:
             self.remove_widget(self._body)
+            self._body = None  # reconstruit à la réouverture (masquages par défaut)
             self._open = False
         else:
             if self._body is None:
@@ -507,6 +506,8 @@ def style_input(ti: TextInput) -> TextInput:
 
 class WalletCheckerApp(App):
     title = "Wallet Checker"
+
+    priced_ok = True
 
     def build(self):
         Window.clearcolor = BG
@@ -671,22 +672,6 @@ class WalletCheckerApp(App):
         beacon_row.add_widget(beacon_input)
         content.add_widget(beacon_row)
 
-        unpriced_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
-        unpriced_checkbox = CheckBox(active=self.settings.get("show_unpriced", False), size_hint=(None, 1), width=dp(44))
-        unpriced_row.add_widget(unpriced_checkbox)
-        unpriced_row.add_widget(WrapLabel(
-            text="Afficher aussi les positions sans valeur connue", size_hint=(1, 1), font_size=sp(12),
-        ))
-        content.add_widget(unpriced_row)
-
-        dust_row = BoxLayout(size_hint=(1, None), height=dp(52), spacing=dp(8))
-        dust_checkbox = CheckBox(active=self.settings.get("show_dust", False), size_hint=(None, 1), width=dp(44))
-        dust_row.add_widget(dust_checkbox)
-        dust_row.add_widget(WrapLabel(
-            text="Afficher aussi les positions de moins de 1 centime", size_hint=(1, 1), font_size=sp(12),
-        ))
-        content.add_widget(dust_row)
-
         gw_row = BoxLayout(size_hint=(1, None), height=dp(48), spacing=dp(8))
         gw_row.add_widget(WrapLabel(text="Gateway API MultiversX (vide = public)", size_hint=(0.5, 1), font_size=sp(12)))
         gw_input = style_input(TextInput(
@@ -742,8 +727,6 @@ class WalletCheckerApp(App):
                 "config_text": config_input.text,
                 "etherscan_key": etherscan_input.text.strip(),
                 "beacon_key": beacon_input.text.strip(),
-                "show_unpriced": unpriced_checkbox.active,
-                "show_dust": dust_checkbox.active,
                 "secure_screen": secure_checkbox.active,
                 "lp_pricing": lp_checkbox.active,
                 "lp_trust_all": trust_checkbox.active,
@@ -835,12 +818,16 @@ class WalletCheckerApp(App):
             except Exception:
                 priced_ok = False  # offline / pricing down: keep raw balances
 
-            if priced_ok and not self.settings.get("show_unpriced", False):
-                report.filter_unpriced(results)
-                if not self.settings.get("show_dust", False):
-                    report.filter_dust(results)
-
-            text = report.format_table(results)
+            # Les positions sans valeur / < 1 centime sont masquées à l'affichage
+            # (avec bouton pour les voir) ; l'export texte suit le même défaut.
+            self.priced_ok = priced_ok
+            text_results = results
+            if priced_ok:
+                import copy
+                text_results = copy.deepcopy(results)
+                report.filter_unpriced(text_results)
+                report.filter_dust(text_results)
+            text = report.format_table(text_results)
             Clock.schedule_once(lambda dt: self._finish(results, text, None, priced_ok, notes))
         except Exception as exc:
             # Never show a raw traceback: it can embed URLs with API keys.
@@ -939,9 +926,40 @@ class WalletCheckerApp(App):
                 chevron=chev, bg=SURFACE,
             ))
 
+    DUST_USD = 0.01
+
+    @staticmethod
+    def _type_stats(wallets):
+        """{type: [count, usd, eur]} over every position (native coin = "coin")."""
+        stats: dict = {}
+        for w in wallets:
+            if w.error:
+                continue
+            items = [("coin", w.native_usd_value, w.native_eur_value)]
+            items += [(t.asset_type or "token", t.usd_value, t.eur_value) for t in w.tokens]
+            for typ, usd, eur in items:
+                st = stats.setdefault(typ, [0, 0.0, 0.0])
+                st[0] += 1
+                st[1] += usd or 0.0
+                st[2] += eur or 0.0
+        return stats
+
+    def _is_hidden(self, usd, eur):
+        """Sans valeur connue ou < 1 centime (seulement si les prix sont disponibles)."""
+        if not self.priced_ok:
+            return False
+        if usd is None and eur is None:
+            return True
+        return usd is not None and usd < self.DUST_USD
+
+    @staticmethod
+    def _counts_text(stats):
+        order = sorted(stats.items(), key=lambda kv: (-kv[1][0], kv[0]))
+        return " · ".join(f"{n} {esc(typ)}" for typ, (n, _u, _e) in order)
+
     def _label_header(self, e):
         card = TapCard(
-            orientation="vertical", size_hint=(1, None), height=dp(94),
+            orientation="vertical", size_hint=(1, None), height=dp(114),
             padding=(dp(16), dp(12), dp(16), dp(12)), spacing=dp(8),
         )
         row1 = BoxLayout(size_hint=(1, None), height=dp(26), spacing=dp(10))
@@ -964,10 +982,16 @@ class WalletCheckerApp(App):
         )
         row3.add_widget(mk_label(right_txt, size=12, color=MUTED, halign="right"))
         card.add_widget(row3)
+        counts = self._counts_text(self._type_stats(e["wallets"]))
+        if counts:
+            card.add_widget(WrapLabel(
+                text=f"[color={MUTED_HEX}]{counts}[/color]", markup=True, font_size=sp(11), min_height=dp(16),
+            ))
         return card, chev
 
     def _label_body(self, wallets):
         body = Panel(bg=CLEAR, padding=(dp(10), 0, dp(10), dp(10)), spacing=dp(8))
+        wallets = sorted(wallets, key=lambda w: -(w.total_eur if (not w.error and w.total_eur is not None) else -1.0))
         for w in wallets:
             header, chev = self._wallet_header(w)
             body.add_widget(Collapsible(
@@ -1012,15 +1036,29 @@ class WalletCheckerApp(App):
                 text=f"[color={ORANGE_HEX}]{esc(w.warning)}[/color]", markup=True, font_size=sp(11),
             ))
 
+        stats = self._type_stats([w])
+        if stats:
+            summary = Panel(bg=SURFACE, radius=dp(10), padding=(dp(10), dp(6), dp(10), dp(6)), spacing=dp(2))
+            for typ, (n, usd, eur) in sorted(stats.items(), key=lambda kv: -kv[1][2]):
+                summary.add_widget(WrapLabel(
+                    text=f"[b]{n}[/b] {esc(typ)}   [color={MUTED_HEX}]{fmt_eur(eur)} · {fmt_usd(usd)}[/color]",
+                    markup=True, font_size=sp(12), min_height=dp(20),
+                ))
+            body.add_widget(summary)
+
+        state = {"n": 0, "tail": [], "reveal": False}
+        native_hidden = self._is_hidden(w.native_usd_value, w.native_eur_value)
+        all_sorted = sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0))
+        visible = [t for t in all_sorted if not self._is_hidden(t.usd_value, t.eur_value)]
+        hidden_n = (len(all_sorted) - len(visible)) + (1 if native_hidden else 0)
         shown = 0
-        if not w.native_hidden:
+        if not native_hidden:
             body.add_widget(self._row(
                 w.native_symbol, "coin", None, w.native_amount, w.native_usd_value, w.native_eur_value,
             ))
             shown += 1
-        ordered = sorted(w.tokens, key=lambda t: -(t.usd_value or 0.0))[:MAX_ROWS_HARD]
-        total_tokens = len(w.tokens)
-        state = {"n": 0, "tail": []}
+        ordered = visible[:MAX_ROWS_HARD]
+        total_tokens = len(visible)
 
         def add_rows(count):
             for t in ordered[state["n"]:state["n"] + count]:
@@ -1046,17 +1084,32 @@ class WalletCheckerApp(App):
                     add_tail()
                 btn.bind(on_release=more)
                 state["tail"].append(btn)
+            total_tokens = len(all_sorted) if state["reveal"] else len(visible)
             if total_tokens > len(ordered) and left <= 0:
                 state["tail"].append(WrapLabel(
                     text=f"[color={FAINT_HEX}]+ {total_tokens - len(ordered)} position(s) non affichée(s) (limite de sécurité)[/color]",
                     markup=True, font_size=sp(11),
                 ))
-            hidden = w.hidden_unpriced_count + w.hidden_dust_count
-            if hidden:
-                state["tail"].append(WrapLabel(
-                    text=f"[color={FAINT_HEX}]{hidden} position(s) masquée(s) (sans valeur ou < 1 centime)[/color]",
-                    markup=True, font_size=sp(11),
-                ))
+            if hidden_n and not state["reveal"] and left <= 0:
+                hb = RoundedButton(
+                    text=f"{hidden_n} position(s) masquée(s) (sans valeur ou < 1 centime) · Afficher",
+                    size_hint=(1, None), height=dp(44), bg=SURFACE2, font_size=sp(12),
+                )
+
+                def reveal(_b):
+                    state["reveal"] = True
+                    for wdg in state["tail"]:
+                        body.remove_widget(wdg)
+                    state["tail"] = []
+                    if native_hidden:
+                        body.add_widget(self._row(
+                            w.native_symbol, "coin", None, w.native_amount, w.native_usd_value, w.native_eur_value,
+                        ))
+                    ordered[:] = [t for t in all_sorted][:MAX_ROWS_HARD]
+                    add_rows(ROWS_PAGE)
+                    add_tail()
+                hb.bind(on_release=reveal)
+                state["tail"].append(hb)
             elif not shown and not ordered:
                 state["tail"].append(WrapLabel(
                     text=f"[color={MUTED_HEX}]Aucune position.[/color]", markup=True, font_size=sp(12),
