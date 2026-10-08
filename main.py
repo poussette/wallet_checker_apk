@@ -14,7 +14,7 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.6"
+__version__ = "0.9.7"
 
 
 
@@ -48,6 +48,7 @@ from kivy.uix.behaviors import ButtonBehavior
 from kivy.uix.boxlayout import BoxLayout
 from kivy.uix.button import Button
 from kivy.uix.checkbox import CheckBox
+from kivy.uix.floatlayout import FloatLayout
 from kivy.uix.label import Label
 from kivy.uix.popup import Popup
 from kivy.uix.scrollview import ScrollView
@@ -58,7 +59,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.6"
+APP_VERSION = "0.9.7"
 
 
 def _version_problems() -> list[str]:
@@ -570,12 +571,12 @@ class WalletCheckerApp(App):
         root.add_widget(self.status_label)
 
         # Barre figée : en-tête du wallet ouvert quand le sien a défilé hors écran.
-        self.sticky = BoxLayout(orientation="vertical", size_hint=(1, None), height=0,
-                                padding=(dp(16), 0, dp(16), dp(4)))
+        # Superposée à la liste (FloatLayout) : n'en change pas la taille, donc aucun saut.
+        self.sticky = FloatLayout(size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
         self._sticky_for = []
+        self._sticky_cards = []
         self.wallet_colls = []
         self.label_colls = []
-        root.add_widget(self.sticky)
 
         # Scrollable results: hero total, stacked bar, collapsible label cards.
         self.results_box = BoxLayout(
@@ -583,10 +584,15 @@ class WalletCheckerApp(App):
             padding=(dp(16), dp(8), dp(16), dp(24)),
         )
         self.results_box.bind(minimum_height=self.results_box.setter("height"))
-        self.scroll = ScrollView(do_scroll_x=False, bar_width=dp(3), bar_color=(1, 1, 1, 0.25))
+        self.scroll = ScrollView(do_scroll_x=False, bar_width=dp(3), bar_color=(1, 1, 1, 0.25),
+                                 size_hint=(1, 1), pos_hint={"x": 0, "y": 0})
         self.scroll.add_widget(self.results_box)
-        root.add_widget(self.scroll)
-        Clock.schedule_interval(self._update_sticky, 0.15)
+        area = FloatLayout()
+        area.add_widget(self.scroll)
+        area.add_widget(self.sticky)
+        root.add_widget(area)
+        self.scroll.bind(scroll_y=self._update_sticky, height=self._update_sticky)
+        Clock.schedule_interval(self._update_sticky, 0.1)
         self._show_empty_hint()
 
         bottom = BoxLayout(
@@ -910,8 +916,8 @@ class WalletCheckerApp(App):
         self.wallet_colls = []
         self.label_colls = []
         self._sticky_for = []
+        self._sticky_cards = []
         self.sticky.clear_widgets()
-        self.sticky.height = 0
         priced = [w for w in results if not w.error and w.total_usd is not None]
         errors = [w for w in results if w.error]
         grand_usd = sum(w.total_usd for w in priced)
@@ -973,44 +979,52 @@ class WalletCheckerApp(App):
             self.label_colls.append(lcoll)
             box.add_widget(lcoll)
 
+    LABEL_PIN_H = 48
+    WALLET_PIN_H = 56
+
     def _update_sticky(self, *_):
-        """Épingle en haut le label puis le wallet ouverts dont l'en-tête a défilé hors écran."""
-        targets = []
+        """Épingle (en surimpression, sans toucher à la liste) le label puis le
+        wallet ouverts dont l'en-tête vient de passer sous le bord haut, tant que
+        leur contenu est encore affiché derrière."""
         try:
-            sy = self.scroll.to_window(0, self.scroll.top)[1]
-            for c in list(self.label_colls) + list(self.wallet_colls):
-                if not c._open or c.get_root_window() is None:
-                    continue
-                hy = c._header.to_window(0, c._header.center_y)[1]
-                if hy > sy and c.to_window(0, c.y)[1] + dp(40) < sy:
-                    targets.append(c)
+            slot = self.scroll.to_window(0, self.scroll.top)[1]
+            gap = dp(2)
+            chosen = []   # (coll, slot_top, height)
+            for colls, h in ((self.label_colls, dp(self.LABEL_PIN_H)), (self.wallet_colls, dp(self.WALLET_PIN_H))):
+                best = None
+                for c in colls:
+                    if not c._open or c.get_root_window() is None:
+                        continue
+                    ht = c._header.to_window(0, c._header.top)[1]
+                    cy = c.to_window(0, c.y)[1]
+                    if ht >= slot and cy + dp(2) < slot - h:
+                        best = c  # le plus profond gagne
+                if best is not None:
+                    chosen.append((best, slot, h))
+                    slot -= h + gap
         except Exception:
-            targets = []
-        # un seul label (le plus profond) puis un seul wallet (le plus profond)
-        labels = [c for c in targets if hasattr(c, "entry")]
-        wallets = [c for c in targets if hasattr(c, "wallet")]
-        targets = labels[-1:] + wallets[-1:]
-        if targets == self._sticky_for:
-            return
-        self._sticky_for = targets
-        self.sticky.clear_widgets()
-        if not targets:
-            self.sticky.height = 0
-            return
-        total = dp(4)
-        for c in targets:
-            if hasattr(c, "entry"):
-                card = self._label_pinned(c.entry)
-            else:
-                card, chev = self._wallet_header(c.wallet)
-                chev.open = True
-            card._bg = SURFACE2
-            card._bg_color.rgba = SURFACE2
-            card.bind(on_release=lambda *_a, c=c: self._close_pinned(c))
-            self.sticky.add_widget(card)
-            total += card.height + dp(4)
-        self.sticky.spacing = dp(4)
-        self.sticky.height = total
+            chosen = []
+        ids = [c for c, _s, _h in chosen]
+        if ids != self._sticky_for:
+            self._sticky_for = ids
+            self.sticky.clear_widgets()
+            self._sticky_cards = []
+            for c, _top, h in chosen:
+                if hasattr(c, "entry"):
+                    card = self._label_pinned(c.entry)
+                else:
+                    card, chev = self._wallet_header(c.wallet)
+                    chev.open = True
+                card._bg = SURFACE2
+                card._bg_color.rgba = SURFACE2
+                card.size_hint = (None, None)
+                card.height = h
+                card.bind(on_release=lambda *_a, c=c, card=card: self._close_pinned(c, card))
+                self.sticky.add_widget(card)
+                self._sticky_cards.append(card)
+        for card, (c, top, h) in zip(self._sticky_cards, chosen):
+            card.width = max(0, self.sticky.width - dp(32))
+            card.pos = (self.sticky.x + dp(16), top - h)
 
     def _label_pinned(self, e):
         card = TapCard(
@@ -1027,8 +1041,8 @@ class WalletCheckerApp(App):
         card.add_widget(chev)
         return card
 
-    def _close_pinned(self, coll):
-        coll.toggle(target_top=self.sticky.to_window(0, self.sticky.top)[1] - dp(4))
+    def _close_pinned(self, coll, card):
+        coll.toggle(target_top=card.to_window(0, card.top)[1])
 
     DUST_USD = 0.01
 

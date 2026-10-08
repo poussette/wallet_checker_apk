@@ -112,3 +112,6 @@ Chaque fichier porte son numéro (`__version__`) et `providers/version.py` fixe 
 
 ## v0.9.6
 - Le label ouvert reste aussi epingle en haut (au-dessus du wallet epingle) tant que son contenu est affiche ; un appui le referme.
+
+## v0.9.7
+- En-tetes epingles (label puis wallet) en surimpression : la liste n est plus redimensionnee, plus de "hoquet" ; ils se figent des que l en-tete atteint le haut et tant que le contenu correspondant est affiche.
