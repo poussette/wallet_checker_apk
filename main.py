@@ -14,7 +14,7 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 
 
 
@@ -58,7 +58,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.4"
+APP_VERSION = "0.9.5"
 
 
 def _version_problems() -> list[str]:
@@ -891,7 +891,7 @@ class WalletCheckerApp(App):
             self.results_box.add_widget(WrapLabel(
                 text=f"[color={RED_HEX}]{esc(safe_error(exc))}[/color]", markup=True, font_size=sp(11),
             ))
-        msg = f"Mis à jour à {time.strftime('%H:%M')} · {len(results)} wallet(s)"
+        msg = f"Mis à jour le {time.strftime('%d/%m/%Y à %H:%M')} · {len(results)} wallet(s)"
         if not priced_ok:
             msg += " · prix indisponibles, soldes bruts affichés"
         for note in notes:
@@ -1124,10 +1124,15 @@ class WalletCheckerApp(App):
         if stats:
             summary = Panel(bg=SURFACE, radius=dp(10), padding=(dp(10), dp(6), dp(10), dp(6)), spacing=dp(2))
             for typ, (n, usd, eur) in sorted(stats.items(), key=lambda kv: -kv[1][2]):
-                summary.add_widget(WrapLabel(
-                    text=f"[b]{n}[/b] {esc(typ)}   [color={MUTED_HEX}]{fmt_eur(eur)} · {fmt_usd(usd)}[/color]",
-                    markup=True, font_size=sp(12), min_height=dp(20),
-                ))
+                line = BoxLayout(size_hint=(1, None), height=dp(20))
+                line.add_widget(mk_label(f"[b]{n}[/b] {esc(typ)}", size=12, markup=True))
+                line.add_widget(mk_label(
+                    fmt_eur(eur), size=12, color=MUTED, halign="right", size_hint=(None, 1), width=dp(96)))
+                line.add_widget(mk_label(
+                    "-", size=12, color=MUTED, halign="center", size_hint=(None, 1), width=dp(16)))
+                line.add_widget(mk_label(
+                    fmt_usd(usd), size=12, color=MUTED, halign="left", size_hint=(None, 1), width=dp(78)))
+                summary.add_widget(line)
             body.add_widget(summary)
 
         state = {"n": 0, "tail": [], "reveal": False}

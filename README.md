@@ -105,3 +105,7 @@ Chaque fichier porte son numéro (`__version__`) et `providers/version.py` fixe 
 - L'ouverture/fermeture d'un onglet ne fait plus sauter l'écran : l'en-tête reste à sa place et la liste commence juste dessous.
 - Dans un wallet ouvert, l'adresse est raccourcie sur une ligne ; un appui la copie dans le presse-papiers.
 - Quand l'en-tête d'un wallet ouvert sort de l'écran en défilant, il reste **épinglé en haut** ; un appui dessus referme le wallet.
+
+## v0.9.5
+- Synthese par type : colonnes alignees a droite, centrees sur le "-" entre EUR et USD.
+- "Mis a jour le JJ/MM/AAAA a HH:MM".
