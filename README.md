@@ -99,3 +99,9 @@ Chaque fichier porte son numéro (`__version__`) et `providers/version.py` fixe 
 - En ouvrant un wallet, une **synthèse par type** (nombre + valorisation totale) apparaît en tête de liste.
 - Les positions **sans valeur connue ou < 1 centime** sont masquées par défaut ; le bouton en bas de liste (« N position(s) masquée(s) … Afficher ») les montre. À la réouverture du wallet elles sont de nouveau masquées. (Les anciennes options des Paramètres ont été supprimées.)
 - À l'ouverture d'un label, les wallets sont triés par valorisation totale décroissante.
+
+## Navigation (v0.9.4)
+
+- L'ouverture/fermeture d'un onglet ne fait plus sauter l'écran : l'en-tête reste à sa place et la liste commence juste dessous.
+- Dans un wallet ouvert, l'adresse est raccourcie sur une ligne ; un appui la copie dans le presse-papiers.
+- Quand l'en-tête d'un wallet ouvert sort de l'écran en défilant, il reste **épinglé en haut** ; un appui dessus referme le wallet.

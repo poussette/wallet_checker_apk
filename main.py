@@ -14,7 +14,7 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.3"
+__version__ = "0.9.4"
 
 
 
@@ -58,7 +58,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.9.4"
 
 
 def _version_problems() -> list[str]:
@@ -478,7 +478,20 @@ class Collapsible(Panel):
         self.add_widget(header)
         header.bind(on_release=self.toggle)
 
-    def toggle(self, *_):
+    def _scroll_parent(self):
+        w = self.parent
+        while w is not None and not isinstance(w, ScrollView):
+            w = w.parent
+        return w
+
+    def toggle(self, *_, target_top=None):
+        """Open/close. The header keeps its place on screen (or is moved to
+        `target_top`, a window y) so the list starts right under it."""
+        sv = self._scroll_parent()
+        try:
+            before = target_top if target_top is not None else self._header.to_window(0, self._header.top)[1]
+        except Exception:
+            sv = None
         if self._open:
             self.remove_widget(self._body)
             self._body = None  # reconstruit à la réouverture (masquages par défaut)
@@ -490,6 +503,23 @@ class Collapsible(Panel):
             self._open = True
         if self._chev is not None:
             self._chev.open = self._open
+        if sv is not None:
+            for delay in (0, 0.08, 0.25):
+                Clock.schedule_once(lambda dt, sv=sv, b=before: self._anchor(sv, b), delay)
+
+    def _anchor(self, sv, target):
+        try:
+            view = sv.children[0]
+            extra = view.height - sv.height
+            if extra <= 0 or self.get_root_window() is None:
+                return
+            now = self._header.to_window(0, self._header.top)[1]
+            delta = target - now
+            if abs(delta) < 1:
+                return
+            sv.scroll_y = min(1.0, max(0.0, sv.scroll_y - delta / extra))
+        except Exception:
+            pass
 
 
 def style_input(ti: TextInput) -> TextInput:
@@ -539,6 +569,13 @@ class WalletCheckerApp(App):
         )
         root.add_widget(self.status_label)
 
+        # Barre figée : en-tête du wallet ouvert quand le sien a défilé hors écran.
+        self.sticky = BoxLayout(orientation="vertical", size_hint=(1, None), height=0,
+                                padding=(dp(16), 0, dp(16), dp(4)))
+        self._sticky_for = None
+        self.wallet_colls = []
+        root.add_widget(self.sticky)
+
         # Scrollable results: hero total, stacked bar, collapsible label cards.
         self.results_box = BoxLayout(
             orientation="vertical", size_hint=(1, None), spacing=dp(10),
@@ -548,6 +585,7 @@ class WalletCheckerApp(App):
         self.scroll = ScrollView(do_scroll_x=False, bar_width=dp(3), bar_color=(1, 1, 1, 0.25))
         self.scroll.add_widget(self.results_box)
         root.add_widget(self.scroll)
+        Clock.schedule_interval(self._update_sticky, 0.15)
         self._show_empty_hint()
 
         bottom = BoxLayout(
@@ -868,6 +906,10 @@ class WalletCheckerApp(App):
 
     def render_results(self, results):
         box = self.results_box
+        self.wallet_colls = []
+        self._sticky_for = None
+        self.sticky.clear_widgets()
+        self.sticky.height = 0
         priced = [w for w in results if not w.error and w.total_usd is not None]
         errors = [w for w in results if w.error]
         grand_usd = sum(w.total_usd for w in priced)
@@ -925,6 +967,37 @@ class WalletCheckerApp(App):
                 header, build_body=lambda ws=e["wallets"]: self._label_body(ws),
                 chevron=chev, bg=SURFACE,
             ))
+
+    def _update_sticky(self, *_):
+        target = None
+        try:
+            top = self.scroll.top
+            for c in self.wallet_colls:
+                if not c._open or c.get_root_window() is None:
+                    continue
+                hy = c._header.to_window(0, c._header.center_y)[1]
+                sy = self.scroll.to_window(0, top)[1]
+                if hy > sy and c.to_window(0, c.y)[1] + dp(40) < sy:
+                    target = c  # le plus profond gagne
+        except Exception:
+            target = None
+        if target is self._sticky_for:
+            return
+        self._sticky_for = target
+        self.sticky.clear_widgets()
+        if target is None:
+            self.sticky.height = 0
+            return
+        card, chev = self._wallet_header(target.wallet)
+        chev.open = True
+        card._bg = SURFACE2
+        card._bg_color.rgba = SURFACE2
+        card.bind(on_release=lambda *_: self._close_pinned(target))
+        self.sticky.add_widget(card)
+        self.sticky.height = card.height + dp(4)
+
+    def _close_pinned(self, coll):
+        coll.toggle(target_top=self.sticky.to_window(0, self.sticky.top)[1] - dp(4))
 
     DUST_USD = 0.01
 
@@ -994,10 +1067,13 @@ class WalletCheckerApp(App):
         wallets = sorted(wallets, key=lambda w: -(w.total_eur if (not w.error and w.total_eur is not None) else -1.0))
         for w in wallets:
             header, chev = self._wallet_header(w)
-            body.add_widget(Collapsible(
+            coll = Collapsible(
                 header, build_body=lambda w=w: self._wallet_body(w),
                 chevron=chev, bg=SURFACE2, radius=dp(12),
-            ))
+            )
+            coll.wallet = w
+            self.wallet_colls.append(coll)
+            body.add_widget(coll)
         return body
 
     def _wallet_header(self, w):
@@ -1023,9 +1099,17 @@ class WalletCheckerApp(App):
 
     def _wallet_body(self, w):
         body = Panel(bg=CLEAR, padding=(dp(14), 0, dp(14), dp(10)), spacing=dp(2))
-        body.add_widget(WrapLabel(
-            text=f"[color={MUTED_HEX}]{esc(w.address)}[/color]", markup=True, font_size=sp(10),
-        ))
+        addr_btn = RoundedButton(
+            text=f"{short_addr(w.address)}   (toucher pour copier)", size_hint=(1, None), height=dp(30),
+            bg=CLEAR, fg=MUTED, bold=False, font_size=sp(11), halign="left",
+        )
+        addr_btn.bind(size=lambda b, _s: setattr(b, "text_size", (b.width, None)))
+
+        def copy_addr(_b, a=w.address, btn=addr_btn):
+            Clipboard.copy(a)
+            btn.text = f"{short_addr(a)}   (adresse copiée)"
+        addr_btn.bind(on_release=copy_addr)
+        body.add_widget(addr_btn)
         if w.error:
             body.add_widget(WrapLabel(
                 text=f"[color={RED_HEX}]Erreur : {esc(w.error)}[/color]", markup=True, font_size=sp(12),
