@@ -14,7 +14,7 @@ wallet to see its positions. Refresh/Copy actions sit at the bottom.
 
 from __future__ import annotations
 
-__version__ = "0.9.1"
+__version__ = "0.9.2"
 
 
 
@@ -58,7 +58,7 @@ from kivy.utils import escape_markup, platform
 import report
 from providers.safe import clean_text, safe_error, validate_rpc_url
 
-APP_VERSION = "0.9.1"
+APP_VERSION = "0.9.2"
 
 
 def _version_problems() -> list[str]:
@@ -639,7 +639,11 @@ class WalletCheckerApp(App):
         )
 
     def open_settings(self, _instance):
-        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8))
+        # The form scrolls (the wallet box keeps a usable height); Annuler/Enregistrer stay pinned below.
+        content = BoxLayout(orientation="vertical", padding=dp(10), spacing=dp(8), size_hint=(1, None), pos_hint={"top": 1})
+        def _fit_height(*_a):
+            content.height = max(content.minimum_height, form_scroll.height)
+        content.bind(minimum_height=_fit_height)
 
         content.add_widget(WrapLabel(
             text="Configuration des wallets (même format que addresses.txt)",
@@ -647,7 +651,7 @@ class WalletCheckerApp(App):
         ))
         config_input = style_input(TextInput(
             text=self.settings.get("config_text", DEFAULT_CONFIG),
-            font_size=sp(12), font_name=MONO_FONT,
+            font_size=sp(12), font_name=MONO_FONT, size_hint=(1, None), height=dp(280),
         ))
         content.add_widget(config_input)
 
@@ -684,7 +688,7 @@ class WalletCheckerApp(App):
         content.add_widget(dust_row)
 
         gw_row = BoxLayout(size_hint=(1, None), height=dp(48), spacing=dp(8))
-        gw_row.add_widget(WrapLabel(text="Nœud MultiversX (vide = public)", size_hint=(0.5, 1), font_size=sp(12)))
+        gw_row.add_widget(WrapLabel(text="Gateway API MultiversX (vide = public)", size_hint=(0.5, 1), font_size=sp(12)))
         gw_input = style_input(TextInput(
             text=self.settings.get("mvx_gateway", ""), multiline=False, size_hint=(0.5, 1),
             hint_text="https://gateway.multiversx.com",
@@ -722,9 +726,16 @@ class WalletCheckerApp(App):
         save_btn = RoundedButton(text="Enregistrer", bg=ACCENT, fg=BG, font_size=sp(15))
         buttons_row.add_widget(cancel_btn)
         buttons_row.add_widget(save_btn)
-        content.add_widget(buttons_row)
 
-        popup = self._popup("Paramètres", content, size_hint=(0.95, 0.95))
+        form_scroll = ScrollView(do_scroll_x=False, bar_width=dp(4), bar_color=(1, 1, 1, 0.3))
+        content.add_widget(Widget())  # espace libre en bas : le formulaire reste aligné en haut
+        form_scroll.bind(height=_fit_height)
+        form_scroll.add_widget(content)
+        outer = BoxLayout(orientation="vertical", spacing=dp(6), padding=(dp(10), 0, dp(10), dp(10)))
+        outer.add_widget(form_scroll)
+        outer.add_widget(buttons_row)
+
+        popup = self._popup("Paramètres", outer, size_hint=(0.95, 0.95))
 
         def do_save(_btn):
             self.save_settings({
@@ -742,7 +753,7 @@ class WalletCheckerApp(App):
             self._apply_secure_screen(self.settings["secure_screen"])
             popup.dismiss()
             self.status_label.text = (
-                "Nœud MultiversX ignoré (https:// requis) ; le reste est enregistré."
+                "Gateway API MultiversX ignorée (https:// requis) ; le reste est enregistré."
                 if gw_rejected else "Configuration enregistrée. Appuie sur Actualiser."
             )
 
