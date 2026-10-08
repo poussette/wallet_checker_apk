@@ -109,3 +109,6 @@ Chaque fichier porte son numéro (`__version__`) et `providers/version.py` fixe 
 ## v0.9.5
 - Synthese par type : colonnes alignees a droite, centrees sur le "-" entre EUR et USD.
 - "Mis a jour le JJ/MM/AAAA a HH:MM".
+
+## v0.9.6
+- Le label ouvert reste aussi epingle en haut (au-dessus du wallet epingle) tant que son contenu est affiche ; un appui le referme.
